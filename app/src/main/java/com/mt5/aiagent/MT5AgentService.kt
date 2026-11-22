@@ -7,38 +7,40 @@ import android.content.Intent
 import android.graphics.Color
 import android.graphics.Path
 import android.graphics.PixelFormat
+import android.graphics.Rect
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
+import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.Button
-import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.TextView
+import java.util.Locale
 import java.util.concurrent.Executors
 
-class MT5AgentService : AccessibilityService() {
+class MT5AgentService : AccessibilityService(), TextToSpeech.OnInitListener {
 
     companion object {
         var instance: MT5AgentService? = null
-        var lastBalanceSummary: String = "Open MT5 Trade tab to sync balance"
+        var lastBalanceSummary: String = "Open MT5 Trade tab to sync"
     }
 
     private var windowManager: WindowManager? = null
     private var overlayView: View? = null
-    private var expandedPanel: LinearLayout? = null
-    private var miniOrb: TextView? = null
-    private var statusTv: TextView? = null
-    private var wakeBtn: TextView? = null
+    private var pillStatusTv: TextView? = null
     private var confirmLayout: LinearLayout? = null
     private var confirmBtn: Button? = null
     private var pendingConfirmAction: (() -> Unit)? = null
@@ -46,20 +48,103 @@ class MT5AgentService : AccessibilityService() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val executor = Executors.newSingleThreadExecutor()
     private var speechRecognizer: SpeechRecognizer? = null
+    private var tts: TextToSpeech? = null
+    private var isTtsReady = false
+    private var isSpeaking = false
     private var isBusy = false
-    private var isWakeWordActive = false
-    private var awaitingPostWakeCommand = false
+    private var awaitingDirectCommand = false
+    private var isOverlayActive = false
 
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
+        tts = TextToSpeech(this, this)
+    }
+
+    private fun isHindi(): Boolean {
+        val prefs = getSharedPreferences("mt5_agent_prefs", Context.MODE_PRIVATE)
+        return prefs.getString("jarvis_lang", "en") == "hi"
+    }
+
+    override fun onInit(status: Int) {
+        if (status == TextToSpeech.SUCCESS) {
+            isTtsReady = true
+            applyVoiceProfile()
+            tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                override fun onStart(utteranceId: String?) { isSpeaking = true }
+                override fun onDone(utteranceId: String?) {
+                    isSpeaking = false
+                    if (isOverlayActive && !isBusy) mainHandler.postDelayed({ startHandsFreeListening() }, 250)
+                }
+                override fun onError(utteranceId: String?) {
+                    isSpeaking = false
+                    if (isOverlayActive && !isBusy) mainHandler.postDelayed({ startHandsFreeListening() }, 500)
+                }
+            })
+        }
+    }
+
+    fun applyVoiceProfile() {
+        if (!isTtsReady) return
+        if (isHindi()) {
+            tts?.language = Locale("hi", "IN")
+            val hiMale = tts?.voices?.firstOrNull { v ->
+                v.locale.language == "hi" && (v.name.contains("male", true) || v.name.contains("hid", true) || v.name.contains("hie", true))
+            }
+            if (hiMale != null) tts?.voice = hiMale
+            tts?.setPitch(0.82f)
+            tts?.setSpeechRate(1.02f)
+        } else {
+            tts?.language = Locale.UK
+            val ukMale = tts?.voices?.firstOrNull { v ->
+                v.locale.language == "en" && (v.locale.country == "GB" || v.name.contains("gb", true)) &&
+                (v.name.contains("male", true) || v.name.contains("gbd", true) || v.name.contains("gbb", true))
+            }
+            if (ukMale != null) tts?.voice = ukMale
+            tts?.setPitch(0.80f)
+            tts?.setSpeechRate(1.03f)
+        }
+    }
+
+    private fun speakJarvis(enText: String, hiText: String) {
+        val text = if (isHindi()) hiText else enText
+        updatePillText(text)
+        if (!isTtsReady) return
+        applyVoiceProfile()
+        mainHandler.post {
+            try { speechRecognizer?.stopListening() } catch (_: Exception) {}
+            isSpeaking = true
+            tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "j_${System.currentTimeMillis()}")
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun wakeAndSwipeUnlock() {
+        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+        if (!pm.isInteractive) {
+            val wl = pm.newWakeLock(
+                PowerManager.FULL_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP or PowerManager.ON_AFTER_RELEASE,
+                "MT5Jarvis::WakeLock"
+            )
+            wl.acquire(5000)
+            // Swipe up from bottom to dismiss lock screen (works seamlessly with Extend Unlock / Smart Lock)
+            mainHandler.postDelayed({
+                val dm = resources.displayMetrics
+                val path = Path().apply {
+                    moveTo(dm.widthPixels / 2f, dm.heightPixels * 0.85f)
+                    lineTo(dm.widthPixels / 2f, dm.heightPixels * 0.25f)
+                }
+                val gesture = GestureDescription.Builder()
+                    .addStroke(GestureDescription.StrokeDescription(path, 0, 300))
+                    .build()
+                dispatchGesture(gesture, null, null)
+            }, 600)
+        }
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        val pkg = event?.packageName?.toString() ?: return
-        if (pkg == "net.metaquotes.metatrader5") {
-            val root = rootInActiveWindow ?: return
-            extractQuickBalance(root)
+        if (event?.packageName?.toString() == "net.metaquotes.metatrader5") {
+            rootInActiveWindow?.let { extractQuickBalance(it) }
         }
     }
 
@@ -67,9 +152,9 @@ class MT5AgentService : AccessibilityService() {
 
     override fun onDestroy() {
         super.onDestroy()
-        isWakeWordActive = false
         hideFloatingAssistant()
         speechRecognizer?.destroy()
+        tts?.shutdown()
         instance = null
     }
 
@@ -79,153 +164,72 @@ class MT5AgentService : AccessibilityService() {
         if (balIdx != -1 && balIdx + 1 < allText.size) {
             val eqIdx = allText.indexOfFirst { it.contains("Equity", ignoreCase = true) }
             val eqVal = if (eqIdx != -1 && eqIdx + 1 < allText.size) allText[eqIdx + 1] else "--"
-            lastBalanceSummary = "Bal: ${allText[balIdx + 1]}  •  Eq: $eqVal"
+            lastBalanceSummary = "Balance ${allText[balIdx + 1]}, Equity $eqVal"
         }
     }
 
-    private fun neonBg(startHex: String, endHex: String, radius: Float = 28f, strokeHex: String? = null): GradientDrawable {
-        return GradientDrawable(
-            GradientDrawable.Orientation.TL_BR,
-            intArrayOf(Color.parseColor(startHex), Color.parseColor(endHex))
-        ).apply {
+    private fun pillBg(bgHex: String, strokeHex: String, radius: Float = 60f): GradientDrawable {
+        return GradientDrawable().apply {
+            setColor(Color.parseColor(bgHex))
             cornerRadius = radius
-            if (strokeHex != null) setStroke(3, Color.parseColor(strokeHex))
+            setStroke(3, Color.parseColor(strokeHex))
         }
     }
 
     fun showFloatingAssistant() {
         mainHandler.post {
             if (overlayView != null) return@post
+            isOverlayActive = true
             windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
 
-            val wakeWord = LearningMemory.getWakeWord(this).uppercase()
-            val rootBox = LinearLayout(this).apply {
+            val wrapper = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
-                setPadding(20, 0, 20, 0)
+                gravity = Gravity.CENTER_HORIZONTAL
             }
 
-            // 1. Minimized Glowing Neon Orb
-            miniOrb = TextView(this).apply {
-                text = "⚡ AI"
-                setTextColor(Color.parseColor("#00F0FF"))
-                typeface = Typeface.DEFAULT_BOLD
-                textSize = 13f
-                setPadding(36, 20, 36, 20)
-                background = neonBg("#EE050B14", "#EE0F172A", 60f, "#00F0FF")
-                visibility = View.GONE
-                setOnClickListener {
-                    visibility = View.GONE
-                    expandedPanel?.visibility = View.VISIBLE
-                }
-            }
-
-            // 2. Expanded Futuristic Command Console
-            expandedPanel = LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                background = neonBg("#F2070D19", "#F20F172A", 36f, "#00F0FF")
-                setPadding(30, 24, 30, 24)
-            }
-
-            val topRow = LinearLayout(this).apply {
+            val pillRow = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
+                background = pillBg("#E6060B19", "#00E5FF", 80f)
+                setPadding(36, 18, 28, 18)
             }
 
-            statusTv = TextView(this).apply {
-                text = "⚡ Ready • Say \"$wakeWord\""
-                setTextColor(Color.parseColor("#E2E8F0"))
-                textSize = 13f
-                typeface = Typeface.DEFAULT_BOLD
-                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            val orb = TextView(this).apply {
+                text = "◉ "
+                setTextColor(Color.parseColor("#00E5FF"))
+                textSize = 15f
             }
 
-            wakeBtn = TextView(this).apply {
-                text = " WAKE: OFF "
-                setTextColor(Color.parseColor("#94A3B8"))
-                textSize = 11f
-                typeface = Typeface.DEFAULT_BOLD
-                setPadding(16, 8, 16, 8)
-                background = neonBg("#1E293B", "#0F172A", 20f, "#334155")
-                setOnClickListener { toggleWakeWordMode() }
-            }
-
-            val btnMin = TextView(this).apply {
-                text = "  —  "
-                setTextColor(Color.parseColor("#94A3B8"))
-                textSize = 16f
-                setOnClickListener {
-                    expandedPanel?.visibility = View.GONE
-                    miniOrb?.visibility = View.VISIBLE
-                }
-            }
-
-            val btnClose = TextView(this).apply {
-                text = " ✕ "
-                setTextColor(Color.parseColor("#F87171"))
-                textSize = 16f
-                setOnClickListener {
-                    isWakeWordActive = false
-                    speechRecognizer?.destroy()
-                    hideFloatingAssistant()
-                }
-            }
-
-            topRow.addView(statusTv)
-            topRow.addView(wakeBtn)
-            topRow.addView(btnMin)
-            topRow.addView(btnClose)
-
-            val inputRow = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                setPadding(0, 16, 0, 0)
-            }
-
-            val inputEt = EditText(this).apply {
-                hint = "Command or 'Learn x means y'..."
-                setHintTextColor(Color.parseColor("#64748B"))
+            pillStatusTv = TextView(this).apply {
+                text = if (isHindi()) "JARVIS • बोलिए 'जार्विस'" else "JARVIS • Say 'Jarvis'"
                 setTextColor(Color.WHITE)
                 textSize = 13f
-                background = neonBg("#0F172A", "#1E293B", 20f, "#334155")
-                setPadding(22, 14, 22, 14)
-                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                typeface = Typeface.DEFAULT_BOLD
+                maxLines = 2
             }
 
-            val btnMic = Button(this).apply {
-                text = "🎙"
-                background = neonBg("#00C853", "#009624", 20f)
-                setTextColor(Color.WHITE)
-                setOnClickListener { startSingleVoiceInput(inputEt) }
+            val closeBtn = TextView(this).apply {
+                text = "   ✕"
+                setTextColor(Color.parseColor("#94A3B8"))
+                textSize = 14f
+                setOnClickListener { hideFloatingAssistant() }
             }
 
-            val btnGo = Button(this).apply {
-                text = "GO"
-                background = neonBg("#0284C7", "#2563EB", 20f)
-                setTextColor(Color.WHITE)
-                setOnClickListener {
-                    val cmd = inputEt.text.toString().trim()
-                    if (cmd.isNotEmpty()) {
-                        inputEt.setText("")
-                        executeCommand(cmd)
-                    }
-                }
-            }
+            pillRow.addView(orb)
+            pillRow.addView(pillStatusTv)
+            pillRow.addView(closeBtn)
 
-            inputRow.addView(inputEt)
-            inputRow.addView(btnMic)
-            inputRow.addView(btnGo)
-
-            // Safety Confirm Bar
             confirmLayout = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 visibility = View.GONE
-                setPadding(0, 16, 0, 0)
+                setPadding(0, 12, 0, 0)
             }
 
             confirmBtn = Button(this).apply {
                 text = "CONFIRM"
-                background = neonBg("#16A34A", "#15803D", 20f, "#4ADE80")
+                background = pillBg("#16A34A", "#4ADE80", 40f)
                 setTextColor(Color.WHITE)
-                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                textSize = 12f
                 setOnClickListener {
                     confirmLayout?.visibility = View.GONE
                     val act = pendingConfirmAction
@@ -236,136 +240,112 @@ class MT5AgentService : AccessibilityService() {
 
             val cancelBtn = Button(this).apply {
                 text = "CANCEL"
-                background = neonBg("#DC2626", "#991B1B", 20f)
+                background = pillBg("#DC2626", "#F87171", 40f)
                 setTextColor(Color.WHITE)
+                textSize = 12f
                 setOnClickListener {
                     confirmLayout?.visibility = View.GONE
                     pendingConfirmAction = null
                     isBusy = false
-                    updateStatus("Action cancelled.")
+                    speakJarvis("Order cancelled, boss.", "ऑर्डर कैंसिल कर दिया है बॉस।")
                 }
             }
 
             confirmLayout?.addView(confirmBtn)
             confirmLayout?.addView(cancelBtn)
-
-            expandedPanel?.addView(topRow)
-            expandedPanel?.addView(inputRow)
-            expandedPanel?.addView(confirmLayout)
-
-            rootBox.addView(miniOrb)
-            rootBox.addView(expandedPanel)
+            wrapper.addView(pillRow)
+            wrapper.addView(confirmLayout)
 
             val params = WindowManager.LayoutParams(
-                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.WRAP_CONTENT,
                 WindowManager.LayoutParams.WRAP_CONTENT,
                 WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
-                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
                 PixelFormat.TRANSLUCENT
             ).apply {
-                gravity = Gravity.TOP or Gravity.START
-                y = 100
+                gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+                y = 95
             }
 
-            overlayView = rootBox
+            var initialX = 0; var initialY = 0; var touchX = 0f; var touchY = 0f
+            pillRow.setOnTouchListener { _, event ->
+                when (event.action) {
+                    MotionEvent.ACTION_DOWN -> {
+                        initialX = params.x; initialY = params.y
+                        touchX = event.rawX; touchY = event.rawY
+                        false
+                    }
+                    MotionEvent.ACTION_MOVE -> {
+                        params.x = initialX + (event.rawX - touchX).toInt()
+                        params.y = initialY + (event.rawY - touchY).toInt()
+                        windowManager?.updateViewLayout(wrapper, params)
+                        true
+                    }
+                    else -> false
+                }
+            }
+
+            overlayView = wrapper
             windowManager?.addView(overlayView, params)
+            speakJarvis("Jarvis online. Ready for your command, boss.", "जार्विस ऑनलाइन है बॉस। बताइए क्या आदेश है?")
         }
     }
 
     fun hideFloatingAssistant() {
         mainHandler.post {
+            isOverlayActive = false
+            awaitingDirectCommand = false
+            try { speechRecognizer?.stopListening() } catch (_: Exception) {}
             overlayView?.let { try { windowManager?.removeView(it) } catch (_: Exception) {} }
             overlayView = null
         }
     }
 
-    private fun updateStatus(msg: String) {
-        mainHandler.post { statusTv?.text = msg }
+    private fun updatePillText(msg: String) {
+        mainHandler.post { pillStatusTv?.text = msg }
     }
 
-    private fun toggleWakeWordMode() {
-        isWakeWordActive = !isWakeWordActive
-        val wakeWord = LearningMemory.getWakeWord(this).uppercase()
-        if (isWakeWordActive) {
-            wakeBtn?.text = " WAKE: ON "
-            wakeBtn?.setTextColor(Color.parseColor("#00F0FF"))
-            wakeBtn?.background = neonBg("#082F49", "#0C4A6E", 20f, "#00F0FF")
-            updateStatus("👂 Listening for \"$wakeWord\"...")
-            startWakeWordLoop()
-        } else {
-            wakeBtn?.text = " WAKE: OFF "
-            wakeBtn?.setTextColor(Color.parseColor("#94A3B8"))
-            wakeBtn?.background = neonBg("#1E293B", "#0F172A", 20f, "#334155")
-            speechRecognizer?.destroy()
-            updateStatus("⚡ Wake word paused")
-        }
-    }
-
-    private fun startWakeWordLoop() {
-        if (!isWakeWordActive) return
+    private fun startHandsFreeListening() {
+        if (!isOverlayActive || isSpeaking || isBusy) return
         mainHandler.post {
             try {
                 speechRecognizer?.destroy()
                 speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this)
                 speechRecognizer?.setRecognitionListener(object : RecognitionListener {
-                    override fun onResults(results: Bundle?) {
-                        val spoken = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()?.lowercase() ?: ""
-                        val wakeWord = LearningMemory.getWakeWord(this@MT5AgentService)
-
-                        if (awaitingPostWakeCommand && spoken.isNotEmpty()) {
-                            awaitingPostWakeCommand = false
-                            executeCommand(spoken)
-                        } else if (spoken.contains(wakeWord)) {
-                            val afterWake = spoken.substringAfter(wakeWord).trim()
-                            if (afterWake.isNotEmpty()) {
-                                executeCommand(afterWake)
-                            } else {
-                                awaitingPostWakeCommand = true
-                                updateStatus("⚡ Yes? Speak your command...")
-                            }
-                        }
-                        if (isWakeWordActive) mainHandler.postDelayed({ startWakeWordLoop() }, 600)
+                    override fun onReadyForSpeech(params: Bundle?) {
+                        if (awaitingDirectCommand) updatePillText(if (isHindi()) "🎙 सुन रहा हूँ बॉस..." else "🎙 Listening, boss...")
                     }
-
-                    override fun onError(error: Int) {
-                        if (isWakeWordActive) mainHandler.postDelayed({ startWakeWordLoop() }, 900)
-                    }
-                    override fun onReadyForSpeech(params: Bundle?) {}
-                    override fun onBeginningOfSpeech() {}
-                    override fun onRmsChanged(rmsdB: Float) {}
-                    override fun onBufferReceived(buffer: ByteArray?) {}
-                    override fun onEndOfSpeech() {}
-                    override fun onPartialResults(partialResults: Bundle?) {}
-                    override fun onEvent(eventType: Int, params: Bundle?) {}
-                })
-                val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-                    putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-                }
-                speechRecognizer?.startListening(intent)
-            } catch (_: Exception) {
-                if (isWakeWordActive) mainHandler.postDelayed({ startWakeWordLoop() }, 1200)
-            }
-        }
-    }
-
-    private fun startSingleVoiceInput(inputEt: EditText) {
-        isWakeWordActive = false
-        mainHandler.post {
-            try {
-                speechRecognizer?.destroy()
-                speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this)
-                speechRecognizer?.setRecognitionListener(object : RecognitionListener {
-                    override fun onReadyForSpeech(params: Bundle?) { updateStatus("🎙 Listening...") }
                     override fun onResults(results: Bundle?) {
                         val spoken = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull() ?: ""
-                        if (spoken.isNotEmpty()) {
-                            inputEt.setText(spoken)
-                            executeCommand(spoken)
+                        val lower = spoken.lowercase()
+
+                        if (awaitingDirectCommand) {
+                            awaitingDirectCommand = false
+                            if (spoken.isNotBlank()) executeCommand(spoken) else startHandsFreeListening()
+                            return
+                        }
+
+                        if (lower.contains("jarvis") || lower.contains("जार्विस") || lower.contains("service")) {
+                            wakeAndSwipeUnlock()
+                            val afterWake = lower
+                                .substringAfter("jarvis", "")
+                                .ifEmpty { lower.substringAfter("जार्विस", "") }
+                                .ifEmpty { lower.substringAfter("service", "") }
+                                .trim()
+
+                            if (afterWake.length < 3) {
+                                awaitingDirectCommand = true
+                                speakJarvis("Yes boss, how may I help you?", "जी बॉस, बताइए मैं आपकी क्या मदद कर सकता हूँ?")
+                            } else {
+                                executeCommand(afterWake)
+                            }
                         } else {
-                            updateStatus("Didn't hear clearly. Try again.")
+                            mainHandler.postDelayed({ startHandsFreeListening() }, 250)
                         }
                     }
-                    override fun onError(error: Int) { updateStatus("Mic error ($error). Tap 🎙 again.") }
+                    override fun onError(error: Int) {
+                        if (isOverlayActive && !isSpeaking && !isBusy) mainHandler.postDelayed({ startHandsFreeListening() }, 600)
+                    }
                     override fun onBeginningOfSpeech() {}
                     override fun onRmsChanged(rmsdB: Float) {}
                     override fun onBufferReceived(buffer: ByteArray?) {}
@@ -375,116 +355,193 @@ class MT5AgentService : AccessibilityService() {
                 })
                 val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
                     putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                    putExtra(RecognizerIntent.EXTRA_LANGUAGE, if (isHindi()) "hi-IN" else "en-IN")
                 }
                 speechRecognizer?.startListening(intent)
-            } catch (e: Exception) {
-                updateStatus("Mic error: ${e.message}")
-            }
+            } catch (_: Exception) {}
         }
     }
 
     fun executeCommand(rawCmd: String) {
         if (isBusy) return
         val prefs = getSharedPreferences("mt5_agent_prefs", Context.MODE_PRIVATE)
-        val savedList = (prefs.getString("mt5_accounts_auto", "") ?: "")
-            .lines().map { it.trim() }.filter { it.isNotEmpty() }
+        val savedList = (prefs.getString("mt5_accounts_auto", "") ?: "").lines().filter { it.isNotBlank() }
+        val creds = MT5LocalBrain.parseCredentials(prefs.getString("mt5_saved_creds", "") ?: "")
 
-        val parsed = MT5LocalBrain.parse(this, rawCmd, savedList)
-        updateStatus(parsed.summary)
+        val parsed = MT5LocalBrain.parse(rawCmd, savedList, creds)
+        speakJarvis(parsed.replyEn, parsed.replyHi)
 
-        if (parsed.type == TaskType.UNKNOWN || parsed.type == TaskType.TEACH_RULE) return
+        if (parsed.type == TaskType.UNKNOWN) return
         isBusy = true
 
         executor.execute {
             try {
-                ensureMT5Open()
                 when (parsed.type) {
-                    TaskType.SCAN_ACCOUNTS -> runAutoScanAccounts()
-                    TaskType.SWITCH_ACCOUNT -> runSwitchAccount(parsed.accountQuery)
-                    TaskType.READ_STATUS -> {
-                        clickByText("Trade")
-                        Thread.sleep(900)
-                        rootInActiveWindow?.let { extractQuickBalance(it) }
-                        updateStatus("💰 $lastBalanceSummary")
+                    TaskType.OPEN_WHATSAPP_CHAT -> runOpenWhatsApp(parsed.chatName)
+                    else -> {
+                        ensureMT5Open()
+                        when (parsed.type) {
+                            TaskType.SCAN_ACCOUNTS -> runAutoScanAccounts()
+                            TaskType.SWITCH_ACCOUNT -> runSwitchAccount(parsed.accountQuery)
+                            TaskType.LOGIN_NEW_ACCOUNT -> parsed.credential?.let { runAutoLoginAccount(it) }
+                            TaskType.READ_BRIEFING -> runMT5Briefing()
+                            TaskType.NAVIGATE -> clickByText(parsed.navTab)
+                            TaskType.OPEN_TRADE -> runOpenTrade(parsed)
+                            TaskType.MODIFY_SL_TP -> runModifyTrade(parsed)
+                            TaskType.CLOSE_TRADE -> runCloseTrade(parsed)
+                            else -> {}
+                        }
                     }
-                    TaskType.NAVIGATE -> {
-                        clickByText(parsed.navTab)
-                        updateStatus("Opened ${parsed.navTab}")
-                    }
-                    TaskType.OPEN_TRADE -> runOpenTrade(parsed)
-                    TaskType.MODIFY_SL_TP -> runModifyTrade(parsed)
-                    TaskType.CLOSE_TRADE -> runCloseTrade(parsed)
-                    else -> {}
                 }
-            } catch (e: Exception) {
-                updateStatus("Error: ${e.message}")
+            } catch (_: Exception) {
+                speakJarvis("Apologies boss, something went wrong.", "माफ कीजिए बॉस, कोई एरर आ गया।")
             } finally {
-                if (pendingConfirmAction == null) isBusy = false
+                if (pendingConfirmAction == null) {
+                    isBusy = false
+                    if (isOverlayActive && !isSpeaking) mainHandler.postDelayed({ startHandsFreeListening() }, 900)
+                }
             }
+        }
+    }
+
+    // Full Android Control: Open WhatsApp & Specific Chat
+    private fun runOpenWhatsApp(contactName: String) {
+        val waIntent = packageManager.getLaunchIntentForPackage("com.whatsapp")
+            ?: packageManager.getLaunchIntentForPackage("com.whatsapp.w4b")
+        if (waIntent == null) {
+            speakJarvis("WhatsApp is not installed, boss.", "बॉस, इस फोन में व्हाट्सएप इंस्टॉल नहीं है।")
+            return
+        }
+        waIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        startActivity(waIntent)
+        Thread.sleep(1500)
+
+        if (contactName.isNotEmpty()) {
+            val chatNode = findBestMatchingNode(rootInActiveWindow, contactName)
+            if (chatNode != null) {
+                tapNodeCenter(chatNode)
+                Thread.sleep(1000)
+                speakJarvis("Opened $contactName's chat, boss.", "बॉस, $contactName का चैट खुल गया है।")
+            } else {
+                // Tap Search icon and type contact name
+                clickByDesc("Search")
+                Thread.sleep(700)
+                findAllEditables(rootInActiveWindow).firstOrNull()?.let {
+                    setNodeText(it, contactName)
+                    Thread.sleep(1000)
+                    findBestMatchingNode(rootInActiveWindow, contactName)?.let { n -> tapNodeCenter(n) }
+                }
+            }
+        }
+    }
+
+    // Live MT5 Trading Status + Drawdown % Briefing
+    private fun runMT5Briefing() {
+        clickByText("Trade")
+        Thread.sleep(1000)
+        val texts = collectAllTexts(rootInActiveWindow)
+        val balIdx = texts.indexOfFirst { it.contains("Balance", true) }
+        val eqIdx = texts.indexOfFirst { it.contains("Equity", true) }
+
+        val balStr = if (balIdx != -1 && balIdx + 1 < texts.size) texts[balIdx + 1] else ""
+        val eqStr = if (eqIdx != -1 && eqIdx + 1 < texts.size) texts[eqIdx + 1] else ""
+
+        val bal = balStr.replace(" ", "").replace(",", "").toDoubleOrNull()
+        val eq = eqStr.replace(" ", "").replace(",", "").toDoubleOrNull()
+
+        if (bal != null && eq != null && bal > 0) {
+            val diff = eq - bal
+            val ddPercent = if (diff < 0) String.format(Locale.US, "%.2f", (-diff / bal) * 100.0) else "0.00"
+            val enMsg = if (diff < 0) {
+                "Boss, your balance is $balStr, equity is $eqStr, and current drawdown is $ddPercent percent."
+            } else {
+                "Boss, your balance is $balStr and equity is $eqStr. You are in profit with zero drawdown."
+            }
+            val hiMsg = if (diff < 0) {
+                "बॉस, आपका बैलेंस $balStr और इक्विटी $eqStr है। अभी आपका ड्रॉडाउन $ddPercent प्रतिशत है।"
+            } else {
+                "बॉस, आपका बैलेंस $balStr और इक्विटी $eqStr है। अभी कोई ड्रॉडाउन नहीं है, आप प्रॉफिट में हैं।"
+            }
+            speakJarvis(enMsg, hiMsg)
+        } else {
+            speakJarvis("Balance is $balStr and Equity is $eqStr, boss.", "बॉस, बैलेंस $balStr और इक्विटी $eqStr है।")
         }
     }
 
     private fun ensureMT5Open() {
-        val currentPkg = rootInActiveWindow?.packageName?.toString()
-        if (currentPkg != "net.metaquotes.metatrader5") {
+        if (rootInActiveWindow?.packageName?.toString() != "net.metaquotes.metatrader5") {
             val intent = packageManager.getLaunchIntentForPackage("net.metaquotes.metatrader5")
             intent?.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            if (intent != null) {
-                startActivity(intent)
-                Thread.sleep(1500)
-            }
+            if (intent != null) { startActivity(intent); Thread.sleep(1400) }
         }
     }
 
     private fun openManageAccounts() {
-        if (!clickByDesc("Open navigation drawer") && !clickByDesc("Navigate up")) {
-            tapCoordinates(75f, 155f)
-        }
+        if (collectAllTexts(rootInActiveWindow).any { it.equals("Accounts", true) }) return
+        if (!clickByDesc("Open navigation drawer") && !clickByDesc("Navigate up")) tapCoordinates(75f, 155f)
         Thread.sleep(900)
         clickByText("Manage accounts")
         Thread.sleep(1100)
     }
 
+    private fun runAutoLoginAccount(cred: SavedCredential) {
+        openManageAccounts()
+        if (!clickByDesc("Add") && !clickByDesc("New")) {
+            val dm = resources.displayMetrics
+            tapCoordinates(dm.widthPixels * 0.80f, dm.heightPixels * 0.08f)
+        }
+        Thread.sleep(1200)
+        findAllEditables(rootInActiveWindow).firstOrNull()?.let { setNodeText(it, cred.broker); Thread.sleep(1400) }
+        findBestMatchingNode(rootInActiveWindow, cred.broker)?.let { tapNodeCenter(it); Thread.sleep(1200) }
+        val fields = findAllEditables(rootInActiveWindow)
+        if (fields.size >= 2) {
+            setNodeText(fields[0], cred.loginId)
+            Thread.sleep(300)
+            setNodeText(fields[1], cred.password)
+            Thread.sleep(400)
+            clickByText("Login")
+            speakJarvis("Logged into ${cred.nickname}, boss.", "बॉस, ${cred.nickname} लॉगिन हो गया है।")
+        } else {
+            speakJarvis("Please tap the broker name on screen, boss.", "बॉस, कृपया स्क्रीन पर ब्रोकर नाम पर टैप करें।")
+        }
+    }
+
     private fun runAutoScanAccounts() {
         openManageAccounts()
-        val texts = collectAllTexts(rootInActiveWindow)
-        val accounts = texts.filter { t ->
-            t.length > 4 && !t.equals("Accounts", true) &&
-            !t.equals("Manage accounts", true) && !t.contains("MetaQuotes", true)
+        val accounts = collectAllTexts(rootInActiveWindow).filter { t ->
+            t.length > 4 && !t.equals("Accounts", true) && !t.equals("Manage accounts", true) && !t.contains("MetaQuotes", true)
         }.distinct()
-
         getSharedPreferences("mt5_agent_prefs", Context.MODE_PRIVATE)
             .edit().putString("mt5_accounts_auto", accounts.joinToString("\n")).apply()
-        updateStatus("✅ Learned ${accounts.size} account items!")
+        speakJarvis("Scan complete, boss. Found ${accounts.size} entries.", "स्कैन पूरा हुआ बॉस, ${accounts.size} अकाउंट्स मिले।")
     }
 
     private fun runSwitchAccount(query: String) {
         openManageAccounts()
-        if (clickByText(query)) {
-            Thread.sleep(800)
+        Thread.sleep(400)
+        val matched = findBestMatchingNode(rootInActiveWindow, query)
+        if (matched != null) {
+            tapNodeCenter(matched)
+            Thread.sleep(900)
             clickByText("Sign in")
-            updateStatus("✅ Switched to $query")
+            speakJarvis("Switched to $query, boss.", "जी बॉस, $query अकाउंट खुल गया है।")
         } else {
-            updateStatus("Account '$query' not found.")
+            speakJarvis("Could not see $query on screen, boss.", "बॉस, $query स्क्रीन पर नहीं दिख रहा।")
         }
     }
 
     private fun runOpenTrade(cmd: ParsedCommand) {
         clickByText("Quotes")
         Thread.sleep(900)
-        if (!clickByText(cmd.symbol)) {
-            updateStatus("${cmd.symbol} not visible in Quotes.")
-            return
-        }
+        val symNode = findBestMatchingNode(rootInActiveWindow, cmd.symbol) ?: return
+        tapNodeCenter(symNode)
         Thread.sleep(700)
         clickByText("New order")
         Thread.sleep(1000)
-        typeIntoFirstNumericField(cmd.lot)
-        Thread.sleep(400)
-
-        askSafetyConfirm("CONFIRM ${cmd.side} ${cmd.symbol} (${cmd.lot})") {
+        findAllEditables(rootInActiveWindow).firstOrNull()?.let { setNodeText(it, cmd.lot) }
+        askSafetyConfirm("CONFIRM ${cmd.side} ${cmd.symbol}") {
             clickByText(cmd.side)
-            updateStatus("✅ Executed ${cmd.side} ${cmd.symbol}")
+            speakJarvis("${cmd.side} order executed, boss.", "बॉस, ${cmd.side} ऑर्डर लग गया है।")
             isBusy = false
         }
     }
@@ -492,21 +549,15 @@ class MT5AgentService : AccessibilityService() {
     private fun runModifyTrade(cmd: ParsedCommand) {
         clickByText("Trade")
         Thread.sleep(900)
-        if (!longClickByText(cmd.symbol)) {
-            updateStatus("No open ${cmd.symbol} trade found.")
-            return
-        }
+        if (!longClickByText(cmd.symbol)) return
         Thread.sleep(700)
         clickByText("Modify position")
         Thread.sleep(900)
-        val valueToSet = cmd.sl.ifEmpty { cmd.tp }
-        if (valueToSet.isNotEmpty()) {
-            typeIntoFirstNumericField(valueToSet)
-            Thread.sleep(400)
-        }
-        askSafetyConfirm("CONFIRM MODIFY ${cmd.symbol}") {
+        val v = cmd.sl.ifEmpty { cmd.tp }
+        if (v.isNotEmpty()) findAllEditables(rootInActiveWindow).firstOrNull()?.let { setNodeText(it, v) }
+        askSafetyConfirm("CONFIRM MODIFY") {
             clickByText("Modify")
-            updateStatus("✅ Modified ${cmd.symbol}")
+            speakJarvis("Modified successfully, boss.", "बॉस, मॉडिफाई हो गया है।")
             isBusy = false
         }
     }
@@ -514,16 +565,13 @@ class MT5AgentService : AccessibilityService() {
     private fun runCloseTrade(cmd: ParsedCommand) {
         clickByText("Trade")
         Thread.sleep(900)
-        if (!longClickByText(cmd.symbol)) {
-            updateStatus("No open ${cmd.symbol} trade found.")
-            return
-        }
+        if (!longClickByText(cmd.symbol)) return
         Thread.sleep(700)
         clickByText("Close position")
         Thread.sleep(900)
-        askSafetyConfirm("CONFIRM CLOSE ${cmd.symbol}") {
+        askSafetyConfirm("CONFIRM CLOSE") {
             clickByText("Close with")
-            updateStatus("✅ Closed ${cmd.symbol}")
+            speakJarvis("Position closed, boss.", "बॉस, पोजीशन क्लोज़ हो गई है।")
             isBusy = false
         }
     }
@@ -533,8 +581,45 @@ class MT5AgentService : AccessibilityService() {
         mainHandler.post {
             confirmBtn?.text = label
             confirmLayout?.visibility = View.VISIBLE
-            updateStatus("⚠️ Tap CONFIRM to execute live")
         }
+        speakJarvis("Tap confirm to execute, boss.", "बॉस, कन्फर्म बटन दबाइए।")
+    }
+
+    private fun findBestMatchingNode(root: AccessibilityNodeInfo?, query: String): AccessibilityNodeInfo? {
+        if (root == null) return null
+        val words = query.lowercase().split(Regex("\\s+")).filter { it.length >= 2 }
+        var bestNode: AccessibilityNodeInfo? = null
+        var bestScore = 0
+        fun traverse(n: AccessibilityNodeInfo?) {
+            if (n == null) return
+            val txt = n.text?.toString()?.lowercase() ?: ""
+            if (txt.isNotEmpty()) {
+                val score = words.count { txt.contains(it) }
+                if (score > bestScore) { bestScore = score; bestNode = n }
+            }
+            for (i in 0 until n.childCount) traverse(n.getChild(i))
+        }
+        traverse(root)
+        return bestNode
+    }
+
+    private fun findAllEditables(root: AccessibilityNodeInfo?): List<AccessibilityNodeInfo> {
+        val list = mutableListOf<AccessibilityNodeInfo>()
+        if (root == null) return list
+        if (root.isEditable) list.add(root)
+        for (i in 0 until root.childCount) list.addAll(findAllEditables(root.getChild(i)))
+        return list
+    }
+
+    private fun setNodeText(node: AccessibilityNodeInfo, value: String) {
+        val args = Bundle().apply { putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, value) }
+        node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+    }
+
+    private fun tapNodeCenter(node: AccessibilityNodeInfo) {
+        val rect = Rect()
+        node.getBoundsInScreen(rect)
+        if (!rect.isEmpty) tapCoordinates(rect.exactCenterX(), rect.exactCenterY())
     }
 
     private fun collectAllTexts(node: AccessibilityNodeInfo?): List<String> {
@@ -547,8 +632,7 @@ class MT5AgentService : AccessibilityService() {
 
     private fun clickByText(target: String): Boolean {
         val root = rootInActiveWindow ?: return false
-        val nodes = root.findAccessibilityNodeInfosByText(target)
-        for (node in nodes) {
+        for (node in root.findAccessibilityNodeInfosByText(target)) {
             var cur: AccessibilityNodeInfo? = node
             while (cur != null) {
                 if (cur.isClickable) return cur.performAction(AccessibilityNodeInfo.ACTION_CLICK)
@@ -559,23 +643,20 @@ class MT5AgentService : AccessibilityService() {
     }
 
     private fun clickByDesc(desc: String): Boolean {
-        val root = rootInActiveWindow ?: return false
-        return findAndClickDesc(root, desc)
-    }
-
-    private fun findAndClickDesc(node: AccessibilityNodeInfo?, desc: String): Boolean {
-        if (node == null) return false
-        if (node.contentDescription?.toString()?.contains(desc, ignoreCase = true) == true && node.isClickable) {
-            return node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+        fun search(n: AccessibilityNodeInfo?): Boolean {
+            if (n == null) return false
+            if (n.contentDescription?.toString()?.contains(desc, true) == true && n.isClickable) {
+                return n.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+            }
+            for (i in 0 until n.childCount) if (search(n.getChild(i))) return true
+            return false
         }
-        for (i in 0 until node.childCount) if (findAndClickDesc(node.getChild(i), desc)) return true
-        return false
+        return search(rootInActiveWindow)
     }
 
     private fun longClickByText(target: String): Boolean {
         val root = rootInActiveWindow ?: return false
-        val nodes = root.findAccessibilityNodeInfosByText(target)
-        for (node in nodes) {
+        for (node in root.findAccessibilityNodeInfosByText(target)) {
             var cur: AccessibilityNodeInfo? = node
             while (cur != null) {
                 if (cur.isLongClickable) return cur.performAction(AccessibilityNodeInfo.ACTION_LONG_CLICK)
@@ -583,25 +664,6 @@ class MT5AgentService : AccessibilityService() {
             }
         }
         return false
-    }
-
-    private fun typeIntoFirstNumericField(value: String): Boolean {
-        val root = rootInActiveWindow ?: return false
-        val field = findFirstEditable(root) ?: return false
-        val args = Bundle().apply {
-            putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, value)
-        }
-        return field.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
-    }
-
-    private fun findFirstEditable(node: AccessibilityNodeInfo?): AccessibilityNodeInfo? {
-        if (node == null) return null
-        if (node.isEditable) return node
-        for (i in 0 until node.childCount) {
-            val found = findFirstEditable(node.getChild(i))
-            if (found != null) return found
-        }
-        return null
     }
 
     private fun tapCoordinates(x: Float, y: Float) {
