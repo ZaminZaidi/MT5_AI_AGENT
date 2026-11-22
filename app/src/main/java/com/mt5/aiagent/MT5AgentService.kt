@@ -10,6 +10,8 @@ import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.media.AudioManager
+import android.media.ToneGenerator
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -49,21 +51,29 @@ class MT5AgentService : AccessibilityService(), TextToSpeech.OnInitListener {
     private val executor = Executors.newSingleThreadExecutor()
     private var speechRecognizer: SpeechRecognizer? = null
     private var tts: TextToSpeech? = null
+    private var toneGen: ToneGenerator? = null
+
     private var isTtsReady = false
     private var isSpeaking = false
     private var isBusy = false
-    private var awaitingDirectCommand = false
     private var isOverlayActive = false
+    // 45-second continuous active session so user doesn't have to repeat "Jarvis"
+    private var activeSessionUntil: Long = 0L
 
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
         tts = TextToSpeech(this, this)
+        try { toneGen = ToneGenerator(AudioManager.STREAM_MUSIC, 65) } catch (_: Exception) {}
     }
 
     private fun isHindi(): Boolean {
         val prefs = getSharedPreferences("mt5_agent_prefs", Context.MODE_PRIVATE)
         return prefs.getString("jarvis_lang", "en") == "hi"
+    }
+
+    private fun playJarvisChime() {
+        try { toneGen?.startTone(ToneGenerator.TONE_PROP_BEEP2, 120) } catch (_: Exception) {}
     }
 
     override fun onInit(status: Int) {
@@ -74,35 +84,36 @@ class MT5AgentService : AccessibilityService(), TextToSpeech.OnInitListener {
                 override fun onStart(utteranceId: String?) { isSpeaking = true }
                 override fun onDone(utteranceId: String?) {
                     isSpeaking = false
-                    if (isOverlayActive && !isBusy) mainHandler.postDelayed({ startHandsFreeListening() }, 250)
+                    if (isOverlayActive && !isBusy) mainHandler.postDelayed({ startHandsFreeListening() }, 200)
                 }
                 override fun onError(utteranceId: String?) {
                     isSpeaking = false
-                    if (isOverlayActive && !isBusy) mainHandler.postDelayed({ startHandsFreeListening() }, 500)
+                    if (isOverlayActive && !isBusy) mainHandler.postDelayed({ startHandsFreeListening() }, 400)
                 }
             })
         }
     }
 
+    // Selects highest-quality Neural Deep Male Voice for authentic JARVIS sound
     fun applyVoiceProfile() {
         if (!isTtsReady) return
+        val voices = tts?.voices ?: emptySet()
         if (isHindi()) {
             tts?.language = Locale("hi", "IN")
-            val hiMale = tts?.voices?.firstOrNull { v ->
-                v.locale.language == "hi" && (v.name.contains("male", true) || v.name.contains("hid", true) || v.name.contains("hie", true))
-            }
-            if (hiMale != null) tts?.voice = hiMale
-            tts?.setPitch(0.82f)
-            tts?.setSpeechRate(1.02f)
+            val bestHi = voices.firstOrNull { it.name.contains("hi-in-x-hid", true) }
+                ?: voices.firstOrNull { it.name.contains("hi-in-x-hie", true) }
+                ?: voices.firstOrNull { it.locale.language == "hi" && it.name.contains("male", true) }
+            if (bestHi != null) tts?.voice = bestHi
+            tts?.setPitch(0.76f)
+            tts?.setSpeechRate(0.98f)
         } else {
             tts?.language = Locale.UK
-            val ukMale = tts?.voices?.firstOrNull { v ->
-                v.locale.language == "en" && (v.locale.country == "GB" || v.name.contains("gb", true)) &&
-                (v.name.contains("male", true) || v.name.contains("gbd", true) || v.name.contains("gbb", true))
-            }
-            if (ukMale != null) tts?.voice = ukMale
-            tts?.setPitch(0.80f)
-            tts?.setSpeechRate(1.03f)
+            val bestUk = voices.firstOrNull { it.name.contains("en-gb-x-gbd", true) }
+                ?: voices.firstOrNull { it.name.contains("en-gb-x-rjs", true) }
+                ?: voices.firstOrNull { it.locale.language == "en" && it.locale.country == "GB" && it.name.contains("male", true) }
+            if (bestUk != null) tts?.voice = bestUk
+            tts?.setPitch(0.74f)
+            tts?.setSpeechRate(0.97f)
         }
     }
 
@@ -127,17 +138,16 @@ class MT5AgentService : AccessibilityService(), TextToSpeech.OnInitListener {
                 "MT5Jarvis::WakeLock"
             )
             wl.acquire(5000)
-            // Swipe up from bottom to dismiss lock screen (works seamlessly with Extend Unlock / Smart Lock)
             mainHandler.postDelayed({
                 val dm = resources.displayMetrics
                 val path = Path().apply {
                     moveTo(dm.widthPixels / 2f, dm.heightPixels * 0.85f)
                     lineTo(dm.widthPixels / 2f, dm.heightPixels * 0.25f)
                 }
-                val gesture = GestureDescription.Builder()
-                    .addStroke(GestureDescription.StrokeDescription(path, 0, 300))
-                    .build()
-                dispatchGesture(gesture, null, null)
+                dispatchGesture(
+                    GestureDescription.Builder().addStroke(GestureDescription.StrokeDescription(path, 0, 300)).build(),
+                    null, null
+                )
             }, 600)
         }
     }
@@ -155,6 +165,7 @@ class MT5AgentService : AccessibilityService(), TextToSpeech.OnInitListener {
         hideFloatingAssistant()
         speechRecognizer?.destroy()
         tts?.shutdown()
+        toneGen?.release()
         instance = null
     }
 
@@ -180,6 +191,7 @@ class MT5AgentService : AccessibilityService(), TextToSpeech.OnInitListener {
         mainHandler.post {
             if (overlayView != null) return@post
             isOverlayActive = true
+            activeSessionUntil = System.currentTimeMillis() + 45_000L
             windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
 
             val wrapper = LinearLayout(this).apply {
@@ -201,7 +213,7 @@ class MT5AgentService : AccessibilityService(), TextToSpeech.OnInitListener {
             }
 
             pillStatusTv = TextView(this).apply {
-                text = if (isHindi()) "JARVIS • बोलिए 'जार्विस'" else "JARVIS • Say 'Jarvis'"
+                text = if (isHindi()) "JARVIS एक्टिव • सीधे बोलिए" else "JARVIS Active • Speak now"
                 setTextColor(Color.WHITE)
                 textSize = 13f
                 typeface = Typeface.DEFAULT_BOLD
@@ -268,17 +280,31 @@ class MT5AgentService : AccessibilityService(), TextToSpeech.OnInitListener {
             }
 
             var initialX = 0; var initialY = 0; var touchX = 0f; var touchY = 0f
+            var isDragging = false
             pillRow.setOnTouchListener { _, event ->
                 when (event.action) {
                     MotionEvent.ACTION_DOWN -> {
                         initialX = params.x; initialY = params.y
                         touchX = event.rawX; touchY = event.rawY
-                        false
+                        isDragging = false
+                        true
                     }
                     MotionEvent.ACTION_MOVE -> {
-                        params.x = initialX + (event.rawX - touchX).toInt()
-                        params.y = initialY + (event.rawY - touchY).toInt()
+                        val dx = (event.rawX - touchX).toInt()
+                        val dy = (event.rawY - touchY).toInt()
+                        if (kotlin.math.abs(dx) > 10 || kotlin.math.abs(dy) > 10) isDragging = true
+                        params.x = initialX + dx
+                        params.y = initialY + dy
                         windowManager?.updateViewLayout(wrapper, params)
+                        true
+                    }
+                    MotionEvent.ACTION_UP -> {
+                        if (!isDragging) {
+                            // Single tap on pill wakes 45s active mode immediately
+                            activeSessionUntil = System.currentTimeMillis() + 45_000L
+                            playJarvisChime()
+                            speakJarvis("Yes boss?", "जी बॉस?")
+                        }
                         true
                     }
                     else -> false
@@ -287,14 +313,15 @@ class MT5AgentService : AccessibilityService(), TextToSpeech.OnInitListener {
 
             overlayView = wrapper
             windowManager?.addView(overlayView, params)
-            speakJarvis("Jarvis online. Ready for your command, boss.", "जार्विस ऑनलाइन है बॉस। बताइए क्या आदेश है?")
+            playJarvisChime()
+            speakJarvis("Jarvis online, boss. Listening.", "जार्विस ऑनलाइन है बॉस। बताइए।")
         }
     }
 
     fun hideFloatingAssistant() {
         mainHandler.post {
             isOverlayActive = false
-            awaitingDirectCommand = false
+            activeSessionUntil = 0L
             try { speechRecognizer?.stopListening() } catch (_: Exception) {}
             overlayView?.let { try { windowManager?.removeView(it) } catch (_: Exception) {} }
             overlayView = null
@@ -305,6 +332,7 @@ class MT5AgentService : AccessibilityService(), TextToSpeech.OnInitListener {
         mainHandler.post { pillStatusTv?.text = msg }
     }
 
+    // Seamless 45s Continuous Conversation + Wake Word Listener
     private fun startHandsFreeListening() {
         if (!isOverlayActive || isSpeaking || isBusy) return
         mainHandler.post {
@@ -313,20 +341,28 @@ class MT5AgentService : AccessibilityService(), TextToSpeech.OnInitListener {
                 speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this)
                 speechRecognizer?.setRecognitionListener(object : RecognitionListener {
                     override fun onReadyForSpeech(params: Bundle?) {
-                        if (awaitingDirectCommand) updatePillText(if (isHindi()) "🎙 सुन रहा हूँ बॉस..." else "🎙 Listening, boss...")
+                        val inSession = System.currentTimeMillis() < activeSessionUntil
+                        if (inSession) {
+                            updatePillText(if (isHindi()) "🎙 सुन रहा हूँ बॉस..." else "🎙 Listening, boss...")
+                        } else {
+                            updatePillText(if (isHindi()) "JARVIS • बोलिए 'जार्विस'" else "JARVIS • Say 'Jarvis'")
+                        }
                     }
                     override fun onResults(results: Bundle?) {
                         val spoken = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull() ?: ""
-                        val lower = spoken.lowercase()
-
-                        if (awaitingDirectCommand) {
-                            awaitingDirectCommand = false
-                            if (spoken.isNotBlank()) executeCommand(spoken) else startHandsFreeListening()
+                        if (spoken.isBlank()) {
+                            mainHandler.postDelayed({ startHandsFreeListening() }, 200)
                             return
                         }
 
-                        if (lower.contains("jarvis") || lower.contains("जार्विस") || lower.contains("service")) {
+                        val lower = spoken.lowercase()
+                        val inSession = System.currentTimeMillis() < activeSessionUntil
+                        val hasWakeWord = lower.contains("jarvis") || lower.contains("जार्विस") || lower.contains("service")
+
+                        if (hasWakeWord) {
                             wakeAndSwipeUnlock()
+                            playJarvisChime()
+                            activeSessionUntil = System.currentTimeMillis() + 45_000L
                             val afterWake = lower
                                 .substringAfter("jarvis", "")
                                 .ifEmpty { lower.substringAfter("जार्विस", "") }
@@ -334,17 +370,20 @@ class MT5AgentService : AccessibilityService(), TextToSpeech.OnInitListener {
                                 .trim()
 
                             if (afterWake.length < 3) {
-                                awaitingDirectCommand = true
                                 speakJarvis("Yes boss, how may I help you?", "जी बॉस, बताइए मैं आपकी क्या मदद कर सकता हूँ?")
                             } else {
-                                executeCommand(afterWake)
+                                executePipeline(afterWake)
                             }
+                        } else if (inSession) {
+                            // Active 45s conversation mode — no need to say "Jarvis" again!
+                            activeSessionUntil = System.currentTimeMillis() + 45_000L
+                            executePipeline(spoken)
                         } else {
-                            mainHandler.postDelayed({ startHandsFreeListening() }, 250)
+                            mainHandler.postDelayed({ startHandsFreeListening() }, 200)
                         }
                     }
                     override fun onError(error: Int) {
-                        if (isOverlayActive && !isSpeaking && !isBusy) mainHandler.postDelayed({ startHandsFreeListening() }, 600)
+                        if (isOverlayActive && !isSpeaking && !isBusy) mainHandler.postDelayed({ startHandsFreeListening() }, 500)
                     }
                     override fun onBeginningOfSpeech() {}
                     override fun onRmsChanged(rmsdB: Float) {}
@@ -362,68 +401,89 @@ class MT5AgentService : AccessibilityService(), TextToSpeech.OnInitListener {
         }
     }
 
-    fun executeCommand(rawCmd: String) {
+    // Executes multi-step command pipelines sequentially
+    fun executePipeline(rawCmd: String) {
         if (isBusy) return
         val prefs = getSharedPreferences("mt5_agent_prefs", Context.MODE_PRIVATE)
         val savedList = (prefs.getString("mt5_accounts_auto", "") ?: "").lines().filter { it.isNotBlank() }
         val creds = MT5LocalBrain.parseCredentials(prefs.getString("mt5_saved_creds", "") ?: "")
 
-        val parsed = MT5LocalBrain.parse(rawCmd, savedList, creds)
-        speakJarvis(parsed.replyEn, parsed.replyHi)
+        val pipeline = MT5LocalBrain.parsePipeline(rawCmd, savedList, creds)
+        val first = pipeline.first()
+        speakJarvis(first.replyEn, first.replyHi)
 
-        if (parsed.type == TaskType.UNKNOWN) return
+        if (first.type == TaskType.UNKNOWN) return
         isBusy = true
 
         executor.execute {
             try {
-                when (parsed.type) {
-                    TaskType.OPEN_WHATSAPP_CHAT -> runOpenWhatsApp(parsed.chatName)
-                    else -> {
-                        ensureMT5Open()
-                        when (parsed.type) {
-                            TaskType.SCAN_ACCOUNTS -> runAutoScanAccounts()
-                            TaskType.SWITCH_ACCOUNT -> runSwitchAccount(parsed.accountQuery)
-                            TaskType.LOGIN_NEW_ACCOUNT -> parsed.credential?.let { runAutoLoginAccount(it) }
-                            TaskType.READ_BRIEFING -> runMT5Briefing()
-                            TaskType.NAVIGATE -> clickByText(parsed.navTab)
-                            TaskType.OPEN_TRADE -> runOpenTrade(parsed)
-                            TaskType.MODIFY_SL_TP -> runModifyTrade(parsed)
-                            TaskType.CLOSE_TRADE -> runCloseTrade(parsed)
-                            else -> {}
+                for (step in pipeline) {
+                    when (step.type) {
+                        TaskType.OPEN_WHATSAPP_CHAT -> runOpenWhatsApp(step.chatName)
+                        else -> {
+                            ensureMT5Open()
+                            when (step.type) {
+                                TaskType.SCAN_ACCOUNTS -> runAutoScanAccounts()
+                                TaskType.SWITCH_ACCOUNT -> runSwitchAccount(step.accountQuery)
+                                TaskType.LOGIN_NEW_ACCOUNT -> step.credential?.let { runAutoLoginAccount(it) }
+                                TaskType.OPEN_CHART -> runOpenSymbolChart(step.symbol)
+                                TaskType.READ_BRIEFING -> runMT5Briefing()
+                                TaskType.NAVIGATE -> clickByText(step.navTab)
+                                TaskType.OPEN_TRADE -> runOpenTrade(step)
+                                TaskType.MODIFY_SL_TP -> runModifyTrade(step)
+                                TaskType.CLOSE_TRADE -> runCloseTrade(step)
+                                else -> {}
+                            }
                         }
                     }
+                    Thread.sleep(1000)
+                }
+                if (pipeline.size > 1 && pendingConfirmAction == null) {
+                    playJarvisChime()
+                    speakJarvis("All steps completed, boss.", "जी बॉस, सारे काम पूरे हो गए।")
                 }
             } catch (_: Exception) {
-                speakJarvis("Apologies boss, something went wrong.", "माफ कीजिए बॉस, कोई एरर आ गया।")
+                speakJarvis("Apologies boss, encountered an error.", "माफ कीजिए बॉस, कोई एरर आ गया।")
             } finally {
                 if (pendingConfirmAction == null) {
                     isBusy = false
+                    activeSessionUntil = System.currentTimeMillis() + 45_000L
                     if (isOverlayActive && !isSpeaking) mainHandler.postDelayed({ startHandsFreeListening() }, 900)
                 }
             }
         }
     }
 
-    // Full Android Control: Open WhatsApp & Specific Chat
+    private fun runOpenSymbolChart(symbol: String) {
+        clickByText("Quotes")
+        Thread.sleep(900)
+        val symNode = findBestMatchingNode(rootInActiveWindow, symbol)
+        if (symNode != null) {
+            tapNodeCenter(symNode)
+            Thread.sleep(700)
+            clickByText("Chart")
+            speakJarvis("$symbol chart is open, boss.", "बॉस, $symbol का चार्ट खुल गया है।")
+        } else {
+            speakJarvis("Could not find $symbol in Quotes, boss.", "बॉस, Quotes में $symbol नहीं मिला।")
+        }
+    }
+
     private fun runOpenWhatsApp(contactName: String) {
         val waIntent = packageManager.getLaunchIntentForPackage("com.whatsapp")
             ?: packageManager.getLaunchIntentForPackage("com.whatsapp.w4b")
         if (waIntent == null) {
-            speakJarvis("WhatsApp is not installed, boss.", "बॉस, इस फोन में व्हाट्सएप इंस्टॉल नहीं है।")
+            speakJarvis("WhatsApp is not installed, boss.", "बॉस, व्हाट्सएप इंस्टॉल नहीं है।")
             return
         }
         waIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         startActivity(waIntent)
         Thread.sleep(1500)
-
         if (contactName.isNotEmpty()) {
             val chatNode = findBestMatchingNode(rootInActiveWindow, contactName)
             if (chatNode != null) {
                 tapNodeCenter(chatNode)
-                Thread.sleep(1000)
                 speakJarvis("Opened $contactName's chat, boss.", "बॉस, $contactName का चैट खुल गया है।")
             } else {
-                // Tap Search icon and type contact name
                 clickByDesc("Search")
                 Thread.sleep(700)
                 findAllEditables(rootInActiveWindow).firstOrNull()?.let {
@@ -435,33 +495,23 @@ class MT5AgentService : AccessibilityService(), TextToSpeech.OnInitListener {
         }
     }
 
-    // Live MT5 Trading Status + Drawdown % Briefing
     private fun runMT5Briefing() {
         clickByText("Trade")
         Thread.sleep(1000)
         val texts = collectAllTexts(rootInActiveWindow)
         val balIdx = texts.indexOfFirst { it.contains("Balance", true) }
         val eqIdx = texts.indexOfFirst { it.contains("Equity", true) }
-
         val balStr = if (balIdx != -1 && balIdx + 1 < texts.size) texts[balIdx + 1] else ""
         val eqStr = if (eqIdx != -1 && eqIdx + 1 < texts.size) texts[eqIdx + 1] else ""
-
         val bal = balStr.replace(" ", "").replace(",", "").toDoubleOrNull()
         val eq = eqStr.replace(" ", "").replace(",", "").toDoubleOrNull()
-
         if (bal != null && eq != null && bal > 0) {
             val diff = eq - bal
             val ddPercent = if (diff < 0) String.format(Locale.US, "%.2f", (-diff / bal) * 100.0) else "0.00"
-            val enMsg = if (diff < 0) {
-                "Boss, your balance is $balStr, equity is $eqStr, and current drawdown is $ddPercent percent."
-            } else {
-                "Boss, your balance is $balStr and equity is $eqStr. You are in profit with zero drawdown."
-            }
-            val hiMsg = if (diff < 0) {
-                "बॉस, आपका बैलेंस $balStr और इक्विटी $eqStr है। अभी आपका ड्रॉडाउन $ddPercent प्रतिशत है।"
-            } else {
-                "बॉस, आपका बैलेंस $balStr और इक्विटी $eqStr है। अभी कोई ड्रॉडाउन नहीं है, आप प्रॉफिट में हैं।"
-            }
+            val enMsg = if (diff < 0) "Boss, balance is $balStr, equity is $eqStr, drawdown is $ddPercent percent."
+            else "Boss, balance is $balStr, equity is $eqStr. Zero drawdown."
+            val hiMsg = if (diff < 0) "बॉस, बैलेंस $balStr और इक्विटी $eqStr है। ड्रॉडाउन $ddPercent प्रतिशत है।"
+            else "बॉस, बैलेंस $balStr और इक्विटी $eqStr है। अभी कोई ड्रॉडाउन नहीं है।"
             speakJarvis(enMsg, hiMsg)
         } else {
             speakJarvis("Balance is $balStr and Equity is $eqStr, boss.", "बॉस, बैलेंस $balStr और इक्विटी $eqStr है।")
@@ -501,8 +551,6 @@ class MT5AgentService : AccessibilityService(), TextToSpeech.OnInitListener {
             Thread.sleep(400)
             clickByText("Login")
             speakJarvis("Logged into ${cred.nickname}, boss.", "बॉस, ${cred.nickname} लॉगिन हो गया है।")
-        } else {
-            speakJarvis("Please tap the broker name on screen, boss.", "बॉस, कृपया स्क्रीन पर ब्रोकर नाम पर टैप करें।")
         }
     }
 
@@ -522,8 +570,9 @@ class MT5AgentService : AccessibilityService(), TextToSpeech.OnInitListener {
         val matched = findBestMatchingNode(rootInActiveWindow, query)
         if (matched != null) {
             tapNodeCenter(matched)
-            Thread.sleep(900)
+            Thread.sleep(1000)
             clickByText("Sign in")
+            Thread.sleep(1200)
             speakJarvis("Switched to $query, boss.", "जी बॉस, $query अकाउंट खुल गया है।")
         } else {
             speakJarvis("Could not see $query on screen, boss.", "बॉस, $query स्क्रीन पर नहीं दिख रहा।")
@@ -585,16 +634,19 @@ class MT5AgentService : AccessibilityService(), TextToSpeech.OnInitListener {
         speakJarvis("Tap confirm to execute, boss.", "बॉस, कन्फर्म बटन दबाइए।")
     }
 
+    // Phonetic Fuzzy Matcher: "Saqib" matches "Sakib", "XAUUSD" matches "XAUUSDc"
     private fun findBestMatchingNode(root: AccessibilityNodeInfo?, query: String): AccessibilityNodeInfo? {
         if (root == null) return null
-        val words = query.lowercase().split(Regex("\\s+")).filter { it.length >= 2 }
+        val pWords = MT5LocalBrain.phonetic(query).split(Regex("\\s+")).filter { it.length >= 2 }
+        if (pWords.isEmpty()) return null
         var bestNode: AccessibilityNodeInfo? = null
         var bestScore = 0
         fun traverse(n: AccessibilityNodeInfo?) {
             if (n == null) return
-            val txt = n.text?.toString()?.lowercase() ?: ""
-            if (txt.isNotEmpty()) {
-                val score = words.count { txt.contains(it) }
+            val rawTxt = n.text?.toString() ?: ""
+            if (rawTxt.isNotEmpty()) {
+                val pTxt = MT5LocalBrain.phonetic(rawTxt)
+                val score = pWords.count { pTxt.contains(it) }
                 if (score > bestScore) { bestScore = score; bestNode = n }
             }
             for (i in 0 until n.childCount) traverse(n.getChild(i))
