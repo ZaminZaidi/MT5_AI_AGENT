@@ -178,7 +178,32 @@ class MT5AgentService : AccessibilityService(), TextToSpeech.OnInitListener {
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event?.packageName?.toString() == "net.metaquotes.metatrader5") {
-            rootInActiveWindow?.let { extractQuickBalance(it) }
+            rootInActiveWindow?.let { root ->
+                val allText = collectAllTexts(root)
+                extractQuickBalance(allText)
+                // Auto-learn MT5 account names silently whenever user visits Accounts screen
+                if (allText.any { it.equals("Accounts", true) }) {
+                    autoLearnAccounts(allText)
+                }
+            }
+        }
+    }
+
+    private fun autoLearnAccounts(allText: List<String>) {
+        val ignore = setOf("Accounts", "Quotes", "Charts", "Trade", "History", "Messages", "Read Only", "Demo", "Real")
+        val candidates = allText.filter { t ->
+            t.length in 4..40 &&
+            t !in ignore &&
+            !t.contains("USD", true) &&
+            !t.contains("Hedge", true) &&
+            !t.contains("Hedging", true) &&
+            !t.matches(Regex("^[0-9.,\\s-]+$"))
+        }
+        if (candidates.isEmpty()) return
+        val prefs = getSharedPreferences("mt5_agent_prefs", Context.MODE_PRIVATE)
+        val existing = (prefs.getString("mt5_accounts_auto", "") ?: "").lines().filter { it.isNotBlank() }.toMutableSet()
+        if (existing.addAll(candidates)) {
+            prefs.edit().putString("mt5_accounts_auto", existing.joinToString("\n")).apply()
         }
     }
 
@@ -193,8 +218,7 @@ class MT5AgentService : AccessibilityService(), TextToSpeech.OnInitListener {
         instance = null
     }
 
-    private fun extractQuickBalance(root: AccessibilityNodeInfo) {
-        val allText = collectAllTexts(root)
+    private fun extractQuickBalance(allText: List<String>) {
         val balIdx = allText.indexOfFirst { it.contains("Balance", ignoreCase = true) }
         if (balIdx != -1 && balIdx + 1 < allText.size) {
             val eqIdx = allText.indexOfFirst { it.contains("Equity", ignoreCase = true) }
@@ -373,35 +397,42 @@ class MT5AgentService : AccessibilityService(), TextToSpeech.OnInitListener {
                         }
                     }
                     override fun onResults(results: Bundle?) {
-                        val spoken = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull() ?: ""
-                        if (spoken.isBlank()) {
+                        val allMatches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                            ?.filter { it.isNotBlank() } ?: emptyList()
+                        if (allMatches.isEmpty()) {
                             mainHandler.postDelayed({ startHandsFreeListening() }, 250)
                             return
                         }
 
-                        val lower = spoken.lowercase()
+                        val primaryLower = allMatches.first().lowercase()
                         val inSession = System.currentTimeMillis() < activeSessionUntil && overlayView != null
-                        val hasWakeWord = lower.contains("jarvis") || lower.contains("जार्विस") || lower.contains("service")
+                        val hasWakeWord = allMatches.any { m ->
+                            val l = m.lowercase()
+                            l.contains("jarvis") || l.contains("जार्विस") || l.contains("service")
+                        }
 
                         if (hasWakeWord) {
                             wakeAndSwipeUnlock()
                             if (overlayView == null) showFloatingAssistant(announce = false)
                             playJarvisChime()
                             activeSessionUntil = System.currentTimeMillis() + 45_000L
-                            val afterWake = lower
-                                .substringAfter("jarvis", "")
-                                .ifEmpty { lower.substringAfter("जार्विस", "") }
-                                .ifEmpty { lower.substringAfter("service", "") }
-                                .trim()
 
-                            if (afterWake.length < 3) {
+                            val strippedAlts = allMatches.map { m ->
+                                m.lowercase()
+                                    .replace("jarvis", "")
+                                    .replace("जार्विस", "")
+                                    .replace("service", "")
+                                    .trim()
+                            }.filter { it.length >= 2 }
+
+                            if (strippedAlts.isEmpty()) {
                                 speakJarvis("Yes boss, how may I help you?", "जी बॉस, बताइए मैं आपकी क्या मदद कर सकता हूँ?")
                             } else {
-                                executePipeline(afterWake)
+                                executePipeline(strippedAlts)
                             }
                         } else if (inSession) {
                             activeSessionUntil = System.currentTimeMillis() + 45_000L
-                            executePipeline(spoken)
+                            executePipeline(allMatches)
                         } else {
                             mainHandler.postDelayed({ startHandsFreeListening() }, 250)
                         }
@@ -421,13 +452,14 @@ class MT5AgentService : AccessibilityService(), TextToSpeech.OnInitListener {
                 val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
                     putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
                     putExtra(RecognizerIntent.EXTRA_LANGUAGE, if (isHindi()) "hi-IN" else "en-IN")
+                    putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
                 }
                 speechRecognizer?.startListening(intent)
             } catch (_: Exception) {}
         }
     }
 
-    fun executePipeline(rawCmd: String) {
+    fun executePipeline(speechAlternatives: List<String>) {
         if (isBusy) return
         isBusy = true
         updatePillText(if (isHindi()) "⚡ सोच रहा हूँ बॉस..." else "⚡ Thinking, boss...")
@@ -435,10 +467,13 @@ class MT5AgentService : AccessibilityService(), TextToSpeech.OnInitListener {
         val prefs = getSharedPreferences("mt5_agent_prefs", Context.MODE_PRIVATE)
         val savedList = (prefs.getString("mt5_accounts_auto", "") ?: "").lines().filter { it.isNotBlank() }
         val creds = MT5LocalBrain.parseCredentials(prefs.getString("mt5_saved_creds", "") ?: "")
+        val currentScreen = collectAllTexts(rootInActiveWindow)
 
         executor.execute {
             try {
-                val pipeline = MT5LocalBrain.parsePipeline(rawCmd, savedList, creds)
+                val pipeline = MT5LocalBrain.parsePipeline(speechAlternatives, currentScreen, savedList, creds)
+                if (pipeline.isEmpty()) return@execute
+
                 val first = pipeline.first()
                 speakJarvis(first.replyEn, first.replyHi)
 
@@ -583,12 +618,11 @@ class MT5AgentService : AccessibilityService(), TextToSpeech.OnInitListener {
 
     private fun runAutoScanAccounts() {
         openManageAccounts()
-        val accounts = collectAllTexts(rootInActiveWindow).filter { t ->
-            t.length > 4 && !t.equals("Accounts", true) && !t.equals("Manage accounts", true) && !t.contains("MetaQuotes", true)
-        }.distinct()
-        getSharedPreferences("mt5_agent_prefs", Context.MODE_PRIVATE)
-            .edit().putString("mt5_accounts_auto", accounts.joinToString("\n")).apply()
-        speakJarvis("Scan complete, boss. Found ${accounts.size} entries.", "स्कैन पूरा हुआ बॉस, ${accounts.size} अकाउंट्स मिले।")
+        val allText = collectAllTexts(rootInActiveWindow)
+        autoLearnAccounts(allText)
+        val saved = (getSharedPreferences("mt5_agent_prefs", Context.MODE_PRIVATE)
+            .getString("mt5_accounts_auto", "") ?: "").lines().filter { it.isNotBlank() }
+        speakJarvis("Scan complete, boss. Learned ${saved.size} accounts.", "स्कैन पूरा हुआ बॉस, ${saved.size} अकाउंट्स याद कर लिए हैं।")
     }
 
     private fun runSwitchAccount(query: String) {
