@@ -56,15 +56,23 @@ object MT5LocalBrain {
         "usdjpy" to "USDJPY", "yen" to "USDJPY"
     )
 
+    // Common SpeechRecognizer mishearings in trading context
+    private val navAliases = mapOf(
+        "chart" to "Charts", "charts" to "Charts", "charge" to "Charts", "change" to "Charts", "chard" to "Charts",
+        "quote" to "Quotes", "quotes" to "Quotes", "coats" to "Quotes", "court" to "Quotes", "codes" to "Quotes",
+        "trade" to "Trade", "trades" to "Trade", "tray" to "Trade", "treed" to "Trade",
+        "history" to "History", "histri" to "History",
+        "messages" to "Messages", "message" to "Messages"
+    )
+
     private val fillerWords = setOf(
         "jarvis", "hey", "ok", "boss", "sir", "please", "open", "switch", "to", "into", "in",
         "account", "accounts", "akaunt", "mt5", "metatrader", "kholo", "khol", "kholna",
         "wala", "wali", "wale", "karo", "kar", "karna", "do", "de", "dena", "karke",
         "click", "on", "tap", "select", "login", "the", "my", "mera", "mere", "meri",
         "mein", "me", "mai", "par", "pe", "ko", "ka", "ki", "ke", "se", "aur", "and", "then",
-        "whatsapp", "chat", "message", "dikh", "raha", "hai", "he", "na", "usko", "use",
-        "isko", "ye", "wo", "woh", "jara", "zara", "bhai", "screen", "chart", "charta",
-        "dikhao", "batao", "check", "lagao", "laga", "hatana", "hatao", "band", "kardo"
+        "whatsapp", "chat", "dikh", "raha", "hai", "he", "na", "usko", "use",
+        "isko", "ye", "wo", "woh", "jara", "zara", "bhai", "screen", "dikhao", "batao", "go"
     )
 
     fun toEnglish(input: String): String {
@@ -123,40 +131,46 @@ object MT5LocalBrain {
         }
     }
 
-    // HYBRID ENGINE: Instant Local Execution first, Fast 5s Cloud AI for everything else
+    // Production Pipeline: Multi-Hypothesis High-Confidence Fast-Path -> Screen-Aware Cloud AI
     fun parsePipeline(
-        rawInput: String,
+        speechAlternatives: List<String>,
+        screenTexts: List<String>,
         savedAccounts: List<String>,
         credentials: List<SavedCredential>
     ): List<ParsedCommand> {
-        // 1. Try instant local multi-step parser first (0ms latency, never times out)
-        val localResult = parseLocalPipeline(rawInput, savedAccounts, credentials)
-        if (localResult.isNotEmpty()) return localResult
+        val primary = speechAlternatives.firstOrNull()?.trim() ?: ""
+        if (primary.isBlank()) return emptyList()
 
-        // 2. For general questions or complex sentences, use Fast Cloud AI (5s timeout)
+        // 1. Check all top speech hypotheses for a high-confidence instant command
+        for (alt in speechAlternatives.take(5)) {
+            val fastResult = parseHighConfidenceLocal(alt, savedAccounts)
+            if (fastResult.isNotEmpty()) return fastResult
+        }
+
+        // 2. Ambiguous or conversational? Send top 3 hypotheses + live screen context to Gemini
         val apiKey = BuildConfig.GEMINI_API_KEY.trim()
         if (apiKey.isNotBlank()) {
-            val cloudResult = askGeminiFast(apiKey, rawInput, savedAccounts)
+            val cloudResult = askGeminiSmart(apiKey, speechAlternatives.take(3), screenTexts, savedAccounts)
             if (cloudResult.isNotEmpty()) return cloudResult
         }
 
         return listOf(
             ParsedCommand(
                 TaskType.CHAT_REPLY,
-                replyEn = "Sorry boss, didn't catch that. Try again.",
-                replyHi = "बॉस, समझ नहीं आया। कृपया दोबारा बोलिए।"
+                replyEn = "Didn't catch that clearly, boss. Say it once more.",
+                replyHi = "बॉस, आवाज़ साफ नहीं आई। एक बार फिर बोलिए।"
             )
         )
     }
 
-    private fun parseLocalPipeline(rawInput: String, savedAccounts: List<String>, credentials: List<SavedCredential>): List<ParsedCommand> {
+    private fun parseHighConfidenceLocal(rawInput: String, savedAccounts: List<String>): List<ParsedCommand> {
         val engFull = toEnglish(rawInput).lowercase().trim()
         val chunks = engFull.split(Regex("\\s*(?:,|\\band\\b|\\bthen\\b|\\baur\\b|\\bkarke\\b|\\bkar ke\\b|\\bphir\\b|\\bfir\\b|\\buske baad\\b)\\s*"))
             .map { it.trim() }.filter { it.length >= 2 }
 
         val commands = mutableListOf<ParsedCommand>()
         for (chunk in chunks) {
-            val parsed = parseLocalSingle(chunk, savedAccounts, credentials)
+            val parsed = parseSingleStrict(chunk, savedAccounts)
             if (parsed.type != TaskType.UNKNOWN) commands.add(parsed)
         }
         return commands
@@ -175,10 +189,12 @@ object MT5LocalBrain {
             .distinct().joinToString(" ").trim()
     }
 
-    private fun parseLocalSingle(text: String, savedAccounts: List<String>, credentials: List<SavedCredential>): ParsedCommand {
+    private fun parseSingleStrict(text: String, savedAccounts: List<String>): ParsedCommand {
         val symbol = detectSymbol(text)
+        val words = text.split(Regex("\\s+")).map { it.replace(Regex("[^a-z0-9]"), "") }.filter { it.isNotEmpty() }
 
-        if (text.contains("whatsapp") || text.contains("chat")) {
+        // 1. WhatsApp
+        if (text.contains("whatsapp")) {
             val contact = extractCleanQuery(text)
             return ParsedCommand(
                 type = TaskType.OPEN_WHATSAPP_CHAT, chatName = contact,
@@ -187,7 +203,8 @@ object MT5LocalBrain {
             )
         }
 
-        if (text.contains("chart") && symbol.isNotEmpty()) {
+        // 2. Symbol Chart (e.g. "gold chart", "open xauusd chart")
+        if (symbol.isNotEmpty() && words.any { it in setOf("chart", "charts", "charge", "change", "open", "kholo", "dikhao") }) {
             return ParsedCommand(
                 type = TaskType.OPEN_CHART, symbol = symbol,
                 replyEn = "Opening $symbol chart, boss.",
@@ -195,7 +212,19 @@ object MT5LocalBrain {
             )
         }
 
-        if (text.contains("status") || text.contains("drawdown") || text.contains("balance") || text.contains("equity") || text.contains("profit")) {
+        // 3. Direct MT5 Bottom Tab Navigation (catches "charts", "charge", "change", "quotes", "coats", "trade", "history")
+        val matchedNav = words.firstOrNull { it in navAliases }
+        if (matchedNav != null && !text.contains("account") && !text.contains("buy") && !text.contains("sell")) {
+            val tab = navAliases[matchedNav]!!
+            return ParsedCommand(
+                type = TaskType.NAVIGATE, navTab = tab,
+                replyEn = "Opening $tab, boss.",
+                replyHi = "जी बॉस, $tab खोल रहा हूँ।"
+            )
+        }
+
+        // 4. Live Balance / Drawdown Briefing
+        if (words.any { it in setOf("status", "drawdown", "balance", "equity", "profit", "briefing") }) {
             return ParsedCommand(
                 TaskType.READ_BRIEFING,
                 replyEn = "Checking your live balance and drawdown, boss.",
@@ -203,6 +232,7 @@ object MT5LocalBrain {
             )
         }
 
+        // 5. Scan Accounts
         if (text.contains("scan") || text.contains("kitne account")) {
             return ParsedCommand(
                 TaskType.SCAN_ACCOUNTS,
@@ -211,7 +241,8 @@ object MT5LocalBrain {
             )
         }
 
-        if (text.contains("sl") || text.contains("stop loss") || text.contains("tp") || text.contains("take profit") || text.contains("modify")) {
+        // 6. Trade Actions (Modify / Close / Buy / Sell)
+        if (words.any { it in setOf("sl", "tp", "modify") } || text.contains("stop loss") || text.contains("take profit")) {
             val slVal = Regex("""(?:sl|stop loss)\s*(?:to|at|ko|par)?\s*(\d+(?:\.\d+)?)""").find(text)?.groupValues?.get(1) ?: ""
             val tpVal = Regex("""(?:tp|take profit)\s*(?:to|at|ko|par)?\s*(\d+(?:\.\d+)?)""").find(text)?.groupValues?.get(1) ?: ""
             val targetSym = symbol.ifEmpty { "XAUUSD" }
@@ -221,7 +252,7 @@ object MT5LocalBrain {
             )
         }
 
-        if (text.contains("close") || text.contains("exit") || text.contains("hatao") || text.contains("band")) {
+        if (words.any { it in setOf("close", "exit", "hatao", "band") }) {
             val targetSym = symbol.ifEmpty { "ALL" }
             return ParsedCommand(
                 type = TaskType.CLOSE_TRADE, symbol = targetSym,
@@ -229,8 +260,8 @@ object MT5LocalBrain {
             )
         }
 
-        if (text.contains("buy") || text.contains("sell")) {
-            val side = if (text.contains("buy")) "BUY" else "SELL"
+        if (words.any { it in setOf("buy", "sell") }) {
+            val side = if (words.contains("buy")) "BUY" else "SELL"
             val lot = Regex("""(\d+\.\d+)""").find(text)?.groupValues?.get(1) ?: "0.01"
             val targetSym = symbol.ifEmpty { "XAUUSD" }
             return ParsedCommand(
@@ -240,47 +271,65 @@ object MT5LocalBrain {
             )
         }
 
-        if (text.contains("mt5") || text.contains("metatrader")) {
-            val cleanQuery = extractCleanQuery(text)
-            if (cleanQuery.isEmpty()) {
-                return ParsedCommand(TaskType.NAVIGATE, navTab = "Trade", replyEn = "Opening MT5, boss.", replyHi = "जी बॉस, MT5 खोल रहा हूँ।")
+        // 7. Strict Account Switch: ONLY if it matches a learned account OR user explicitly said "account"/"switch"
+        val cleanQuery = extractCleanQuery(text)
+        if (cleanQuery.isNotEmpty()) {
+            val pWords = phonetic(cleanQuery).split(" ").filter { it.length >= 3 }
+            val learnedMatch = savedAccounts.firstOrNull { acc ->
+                val pAcc = phonetic(acc)
+                pWords.any { pAcc.contains(it) }
+            }
+            if (learnedMatch != null) {
+                return ParsedCommand(
+                    type = TaskType.SWITCH_ACCOUNT, accountQuery = learnedMatch,
+                    replyEn = "Switching to $learnedMatch, boss.",
+                    replyHi = "जी बॉस, $learnedMatch अकाउंट खोल रहा हूँ।"
+                )
+            }
+            if (text.contains("account") || text.contains("akaunt") || text.contains("switch")) {
+                return ParsedCommand(
+                    type = TaskType.SWITCH_ACCOUNT, accountQuery = cleanQuery,
+                    replyEn = "Switching to $cleanQuery, boss.",
+                    replyHi = "जी बॉस, $cleanQuery अकाउंट खोल रहा हूँ।"
+                )
             }
         }
 
-        if (text.contains("account") || text.contains("akaunt") || text.contains("switch") || text.contains("khol") || text.contains("open") || text.contains("chart")) {
-            val cleanQuery = extractCleanQuery(text)
-            if (cleanQuery.isEmpty() && text.contains("chart")) {
-                return ParsedCommand(TaskType.NAVIGATE, navTab = "Charts", replyEn = "Opening Charts, boss.", replyHi = "चार्ट खोल रहा हूँ बॉस।")
-            }
-            when (cleanQuery) {
-                "quotes", "quote" -> return ParsedCommand(TaskType.NAVIGATE, navTab = "Quotes", replyEn = "Opening Quotes, boss.", replyHi = "कोट्स खोल रहा हूँ बॉस।")
-                "charts", "chart" -> return ParsedCommand(TaskType.NAVIGATE, navTab = "Charts", replyEn = "Opening Charts, boss.", replyHi = "चार्ट खोल रहा हूँ बॉस।")
-                "trade", "trades" -> return ParsedCommand(TaskType.NAVIGATE, navTab = "Trade", replyEn = "Opening Trade tab, boss.", replyHi = "ट्रेड टैब खोल रहा हूँ बॉस।")
-                "history" -> return ParsedCommand(TaskType.NAVIGATE, navTab = "History", replyEn = "Opening History, boss.", replyHi = "हिस्ट्री खोल रहा हूँ बॉस।")
-            }
-            if (cleanQuery.isNotEmpty()) {
-                val pWords = phonetic(cleanQuery).split(" ").filter { it.length >= 3 }
-                val matchedAcc = savedAccounts.firstOrNull { acc ->
-                    val pAcc = phonetic(acc)
-                    pWords.any { pAcc.contains(it) }
-                }
-                val finalQuery = matchedAcc ?: cleanQuery
-                return ParsedCommand(
-                    type = TaskType.SWITCH_ACCOUNT, accountQuery = finalQuery,
-                    replyEn = "Switching to $finalQuery, boss.",
-                    replyHi = "जी बॉस, $finalQuery अकाउंट खोल रहा हूँ।"
-                )
-            }
+        // 8. Just "open MT5"
+        if (text.contains("mt5") || text.contains("metatrader")) {
+            return ParsedCommand(TaskType.NAVIGATE, navTab = "Trade", replyEn = "Opening MT5, boss.", replyHi = "जी बॉस, MT5 खोल रहा हूँ।")
         }
 
         return ParsedCommand(TaskType.UNKNOWN)
     }
 
-    private fun askGeminiFast(apiKey: String, userSpeech: String, savedAccounts: List<String>): List<ParsedCommand> {
+    private fun askGeminiSmart(
+        apiKey: String,
+        speechAlts: List<String>,
+        screenTexts: List<String>,
+        savedAccounts: List<String>
+    ): List<ParsedCommand> {
         val prompt = """
-            You are JARVIS, a crisp, smart assistant. User said: "$userSpeech".
-            Return ONLY a JSON array with 1 object:
-            [{"type":"CHAT_REPLY","replyEn":"Short crisp English answer (max 15 words)","replyHi":"Short natural Hindi answer calling user बॉस (max 15 words)"}]
+            You are JARVIS, an expert Android & MetaTrader 5 AI assistant.
+            The phone microphone can mishear words (e.g. "charge"/"change" = "Charts", "coats" = "Quotes").
+            Use the speech hypotheses AND what is currently on screen to infer the user's true intent.
+
+            Speech guesses: ${speechAlts.joinToString(" | ")}
+            Known MT5 accounts: ${savedAccounts.take(15).joinToString(", ")}
+            Current screen text: ${screenTexts.take(20).joinToString(", ")}
+
+            Return ONLY a JSON array of 1 or more objects:
+            {
+              "type": "NAVIGATE" | "SWITCH_ACCOUNT" | "OPEN_CHART" | "OPEN_TRADE" | "MODIFY_SL_TP" | "CLOSE_TRADE" | "READ_BRIEFING" | "OPEN_WHATSAPP_CHAT" | "SCAN_ACCOUNTS" | "CHAT_REPLY",
+              "navTab": "Quotes / Charts / Trade / History / Messages",
+              "accountQuery": "exact account name from known accounts or screen",
+              "symbol": "XAUUSD / BTCUSD / NAS100 / EURUSD etc.",
+              "side": "BUY or SELL",
+              "lot": "0.01",
+              "chatName": "",
+              "replyEn": "Short natural JARVIS reply (max 12 words)",
+              "replyHi": "Short natural Hindi reply calling user बॉस (max 12 words)"
+            }
         """.trimIndent()
 
         return try {
@@ -290,8 +339,8 @@ object MT5LocalBrain {
                 setRequestProperty("Content-Type", "application/json")
                 setRequestProperty("X-goog-api-key", apiKey)
                 doOutput = true
-                connectTimeout = 4500
-                readTimeout = 5500
+                connectTimeout = 5000
+                readTimeout = 6500
             }
 
             val body = JSONObject().apply {
@@ -311,14 +360,25 @@ object MT5LocalBrain {
 
             raw = raw.removePrefix("```json").removePrefix("```").removeSuffix("```").trim()
             val arr = if (raw.startsWith("[")) JSONArray(raw) else JSONArray().put(JSONObject(raw))
-            val o = arr.getJSONObject(0)
-            listOf(
-                ParsedCommand(
-                    type = TaskType.CHAT_REPLY,
-                    replyEn = o.optString("replyEn", "Right away, boss."),
-                    replyHi = o.optString("replyHi", "जी बॉस।")
+            val list = mutableListOf<ParsedCommand>()
+            for (i in 0 until arr.length()) {
+                val o = arr.getJSONObject(i)
+                val t = try { TaskType.valueOf(o.optString("type", "CHAT_REPLY")) } catch (_: Exception) { TaskType.CHAT_REPLY }
+                list.add(
+                    ParsedCommand(
+                        type = t,
+                        symbol = o.optString("symbol", ""),
+                        side = o.optString("side", ""),
+                        lot = o.optString("lot", "0.01"),
+                        accountQuery = o.optString("accountQuery", ""),
+                        chatName = o.optString("chatName", ""),
+                        navTab = o.optString("navTab", ""),
+                        replyEn = o.optString("replyEn", "Right away, boss."),
+                        replyHi = o.optString("replyHi", "जी बॉस।")
+                    )
                 )
-            )
+            }
+            list
         } catch (_: Exception) {
             emptyList()
         }
