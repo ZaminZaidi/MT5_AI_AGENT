@@ -259,7 +259,7 @@ object MT5LocalBrain {
             return ParsedCommand(
                 type = TaskType.OPEN_TRADE,
                 symbol = targetSym, side = side, lot = lot,
-                replyEn = "Preparing $side order on $targetSym for$lot lot, boss.",
+                replyEn = "Preparing $side order on $targetSym for $lot lot, boss.",
                 replyHi = "जी बॉस, $targetSym पर $lot लॉट का $side ऑर्डर लगा रहा हूँ।"
             )
         }
