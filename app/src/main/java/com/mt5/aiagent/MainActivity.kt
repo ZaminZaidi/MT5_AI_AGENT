@@ -52,13 +52,12 @@ class MainActivity : AppCompatActivity() {
         }
 
         val sub = TextView(this).apply {
-            text = "Always-On Autonomous MT5 & Android Assistant"
+            text = "Cloud AI • Always-On MT5 & Android Assistant"
             setTextColor(Color.parseColor("#94A3B8"))
             textSize = 13f
             setPadding(0, 6, 0, 32)
         }
 
-        // Clean Status Card
         val statusCard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             background = bg("#0F172A", 28f, "#1E293B")
@@ -67,7 +66,6 @@ class MainActivity : AppCompatActivity() {
         statusTv = TextView(this).apply { textSize = 14f }
         statusCard.addView(statusTv)
 
-        // Language Toggle
         val langLabel = TextView(this).apply {
             text = "VOICE LANGUAGE"
             setTextColor(Color.parseColor("#64748B"))
@@ -141,13 +139,6 @@ class MainActivity : AppCompatActivity() {
             startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
         }
 
-        val tipTv = TextView(this).apply {
-            text = "Tip: Even if you close the floating pill (✕), just say 'Jarvis' anytime from any app and it will pop right back up."
-            setTextColor(Color.parseColor("#64748B"))
-            textSize = 12f
-            setPadding(8, 36, 8, 0)
-        }
-
         layout.addView(title)
         layout.addView(sub)
         layout.addView(statusCard)
@@ -156,7 +147,6 @@ class MainActivity : AppCompatActivity() {
         layout.addView(btnAlwaysOn)
         layout.addView(btnShowPill)
         layout.addView(btnAcc)
-        layout.addView(tipTv)
 
         scroll.addView(layout)
         setContentView(scroll)
@@ -177,7 +167,7 @@ class MainActivity : AppCompatActivity() {
         super.onResume()
         val running = MT5AgentService.instance != null
         statusTv.text = if (running) {
-            "● JARVIS 24/7 ENGINE ACTIVE\n${MT5AgentService.lastBalanceSummary}"
+            "● JARVIS CLOUD AI READY\n${MT5AgentService.lastBalanceSummary}"
         } else {
             "○ ENGINE OFFLINE — Enable Accessibility"
         }
