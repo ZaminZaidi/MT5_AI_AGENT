@@ -22,14 +22,12 @@ import androidx.core.content.ContextCompat
 class MainActivity : AppCompatActivity() {
 
     private lateinit var statusTv: TextView
-    private lateinit var memoryTv: TextView
-    private lateinit var accountsTv: TextView
+    private lateinit var btnEn: Button
+    private lateinit var btnHi: Button
 
-    private fun gradientCard(startHex: String, endHex: String, radius: Float = 32f, strokeHex: String? = null): GradientDrawable {
-        return GradientDrawable(
-            GradientDrawable.Orientation.TL_BR,
-            intArrayOf(Color.parseColor(startHex), Color.parseColor(endHex))
-        ).apply {
+    private fun bg(hex: String, radius: Float = 30f, strokeHex: String? = null): GradientDrawable {
+        return GradientDrawable().apply {
+            setColor(Color.parseColor(hex))
             cornerRadius = radius
             if (strokeHex != null) setStroke(2, Color.parseColor(strokeHex))
         }
@@ -38,276 +36,166 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         supportActionBar?.hide()
+        val prefs = getSharedPreferences("mt5_agent_prefs", Context.MODE_PRIVATE)
 
-        val scroll = ScrollView(this).apply {
-            setBackgroundColor(Color.parseColor("#050811"))
-        }
-
+        val scroll = ScrollView(this).apply { setBackgroundColor(Color.parseColor("#060B19")) }
         val layout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(48, 130, 48, 70)
+            setPadding(44, 120, 44, 60)
         }
 
-        // Header
-        val titleTv = TextView(this).apply {
-            text = "⚡ MT5 NEURAL AGENT"
-            setTextColor(Color.WHITE)
-            typeface = Typeface.DEFAULT_BOLD
+        val title = TextView(this).apply {
+            text = "◉ J.A.R.V.I.S  MT5"
+            setTextColor(Color.parseColor("#00E5FF"))
             textSize = 24f
+            typeface = Typeface.DEFAULT_BOLD
         }
 
-        val subTv = TextView(this).apply {
-            text = "Offline Self-Learning AI  •  Custom Wake Word"
-            setTextColor(Color.parseColor("#00F0FF"))
+        val sub = TextView(this).apply {
+            text = "Hands-Free Autonomous Trading Assistant"
+            setTextColor(Color.parseColor("#94A3B8"))
             textSize = 13f
-            setPadding(0, 6, 0, 32)
+            setPadding(0, 6, 0, 28)
         }
 
-        // 1. Live Engine Status Card
         val statusCard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            background = gradientCard("#0F172A", "#1E293B", 32f, "#00F0FF")
-            setPadding(36, 32, 36, 32)
+            background = bg("#0F172A", 28f, "#1E293B")
+            setPadding(36, 28, 36, 28)
         }
-        statusTv = TextView(this).apply {
-            textSize = 15f
-            typeface = Typeface.DEFAULT_BOLD
-        }
+        statusTv = TextView(this).apply { textSize = 14f }
         statusCard.addView(statusTv)
 
-        fun makeNeonBtn(label: String, startHex: String, endHex: String, strokeHex: String? = null, onClick: () -> Unit): Button {
+        val langLabel = TextView(this).apply {
+            text = "VOICE LANGUAGE"
+            setTextColor(Color.parseColor("#64748B"))
+            textSize = 11f
+            setPadding(4, 28, 0, 10)
+        }
+
+        val langRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        btnEn = Button(this).apply {
+            text = "ENGLISH (UK)"
+            setTextColor(Color.WHITE)
+            textSize = 12f
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply { setMargins(0, 0, 12, 0) }
+            setOnClickListener {
+                prefs.edit().putString("jarvis_lang", "en").apply()
+                MT5AgentService.instance?.applyVoiceProfile()
+                refreshLangButtons(prefs)
+            }
+        }
+        btnHi = Button(this).apply {
+            text = "हिंदी (HINDI)"
+            setTextColor(Color.WHITE)
+            textSize = 12f
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply { setMargins(12, 0, 0, 0) }
+            setOnClickListener {
+                prefs.edit().putString("jarvis_lang", "hi").apply()
+                MT5AgentService.instance?.applyVoiceProfile()
+                refreshLangButtons(prefs)
+            }
+        }
+        langRow.addView(btnEn)
+        langRow.addView(btnHi)
+        refreshLangButtons(prefs)
+
+        fun makeBtn(label: String, bgHex: String, strokeHex: String? = null, onClick: () -> Unit): Button {
             return Button(this).apply {
                 text = label
                 setTextColor(Color.WHITE)
-                typeface = Typeface.DEFAULT_BOLD
                 textSize = 14f
-                background = gradientCard(startHex, endHex, 26f, strokeHex)
-                layoutParams = LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT
-                ).apply { setMargins(0, 22, 0, 0) }
+                typeface = Typeface.DEFAULT_BOLD
+                background = bg(bgHex, 24f, strokeHex)
+                layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+                    .apply { setMargins(0, 22, 0, 0) }
                 setPadding(24, 34, 24, 34)
                 setOnClickListener { onClick() }
             }
         }
 
-        val btnLaunch = makeNeonBtn("🚀 LAUNCH FLOATING AI + OPEN MT5", "#00C853", "#059669", "#4ADE80") {
+        val btnLaunch = makeBtn("⚡ ACTIVATE JARVIS + OPEN MT5", "#0284C7", "#38BDF8") {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.RECORD_AUDIO), 101)
+                return@makeBtn
+            }
             val svc = MT5AgentService.instance
             if (svc == null) {
-                Toast.makeText(this, "Enable Accessibility Service first", Toast.LENGTH_LONG).show()
+                Toast.makeText(this, "Enable Accessibility first", Toast.LENGTH_LONG).show()
                 startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
-                return@makeNeonBtn
+                return@makeBtn
             }
             svc.showFloatingAssistant()
-            val mt5 = packageManager.getLaunchIntentForPackage("net.metaquotes.metatrader5")
-            if (mt5 != null) startActivity(mt5)
+            packageManager.getLaunchIntentForPackage("net.metaquotes.metatrader5")?.let { startActivity(it) }
         }
 
-        val btnScan = makeNeonBtn("🔍 AUTO-SCAN MT5 ACCOUNTS", "#0284C7", "#2563EB", "#38BDF8") {
-            val svc = MT5AgentService.instance
-            if (svc == null) {
-                Toast.makeText(this, "Enable Accessibility Service first", Toast.LENGTH_LONG).show()
-                return@makeNeonBtn
-            }
-            svc.showFloatingAssistant()
-            svc.executeCommand("scan accounts")
+        val btnAcc = makeBtn("⚙️ ACCESSIBILITY SETTINGS", "#1E293B") {
+            startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
         }
 
-        // 2. Custom Wake Word Card
-        val wakeCard = LinearLayout(this).apply {
+        val vaultCard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            background = gradientCard("#0B1120", "#111827", 30f, "#1E293B")
-            setPadding(36, 30, 36, 30)
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { setMargins(0, 28, 0, 0) }
+            background = bg("#0F172A", 28f, "#1E293B")
+            setPadding(36, 28, 36, 28)
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+                .apply { setMargins(0, 30, 0, 0) }
         }
 
-        val wakeLabel = TextView(this).apply {
-            text = "🎙 CUSTOM WAKE WORD"
-            setTextColor(Color.parseColor("#00F0FF"))
+        val vaultTitle = TextView(this).apply {
+            text = "AUTO-LOGIN VAULT (LOCAL ONLY)"
+            setTextColor(Color.parseColor("#38BDF8"))
+            textSize = 12f
             typeface = Typeface.DEFAULT_BOLD
-            textSize = 12f
-            setPadding(0, 0, 0, 12)
         }
-
-        val wakeRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        val wakeEt = EditText(this).apply {
-            hint = "e.g. Jarvis, Ghost, Boss"
-            setText(LearningMemory.getWakeWord(this@MainActivity))
-            setTextColor(Color.WHITE)
-            setHintTextColor(Color.parseColor("#64748B"))
-            background = gradientCard("#1E293B", "#0F172A", 18f, "#334155")
-            setPadding(24, 18, 24, 18)
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-        }
-        val btnSaveWake = Button(this).apply {
-            text = "SET"
-            setTextColor(Color.WHITE)
-            background = gradientCard("#0284C7", "#2563EB", 18f)
-            setOnClickListener {
-                LearningMemory.setWakeWord(this@MainActivity, wakeEt.text.toString())
-                Toast.makeText(this@MainActivity, "Wake word saved: ${wakeEt.text}", Toast.LENGTH_SHORT).show()
-            }
-        }
-        wakeRow.addView(wakeEt)
-        wakeRow.addView(btnSaveWake)
-        wakeCard.addView(wakeLabel)
-        wakeCard.addView(wakeRow)
-
-        // 3. Auto-Learning & Custom Shortcuts Card
-        val learnCard = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            background = gradientCard("#0B1120", "#111827", 30f, "#1E293B")
-            setPadding(36, 30, 36, 30)
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { setMargins(0, 24, 0, 0) }
-        }
-
-        val learnHeader = TextView(this).apply {
-            text = "🧠 SELF-LEARNING MEMORY"
-            setTextColor(Color.parseColor("#A855F7"))
-            typeface = Typeface.DEFAULT_BOLD
-            textSize = 12f
-            setPadding(0, 0, 0, 12)
-        }
-
-        val phraseEt = EditText(this).apply {
-            hint = "When I say... (e.g. sniper)"
-            setTextColor(Color.WHITE)
-            setHintTextColor(Color.parseColor("#64748B"))
-            background = gradientCard("#1E293B", "#0F172A", 18f, "#334155")
-            setPadding(24, 16, 24, 16)
-        }
-        val actionEt = EditText(this).apply {
-            hint = "Do this... (e.g. buy gold 0.05)"
-            setTextColor(Color.WHITE)
-            setHintTextColor(Color.parseColor("#64748B"))
-            background = gradientCard("#1E293B", "#0F172A", 18f, "#334155")
-            setPadding(24, 16, 24, 16)
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { setMargins(0, 14, 0, 14) }
-        }
-        val btnTeach = makeNeonBtn("+ TEACH AI THIS SHORTCUT", "#7C3AED", "#6D28D9", "#A855F7") {
-            val p = phraseEt.text.toString().trim()
-            val a = actionEt.text.toString().trim()
-            if (p.isNotEmpty() && a.isNotEmpty()) {
-                LearningMemory.saveRule(this, p, a)
-                phraseEt.setText("")
-                actionEt.setText("")
-                refreshDashboard()
-                Toast.makeText(this, "Learned: $p → $a", Toast.LENGTH_SHORT).show()
-            }
-        }
-        memoryTv = TextView(this).apply {
-            setTextColor(Color.parseColor("#CBD5E1"))
-            textSize = 13f
-            setPadding(0, 20, 0, 0)
-        }
-        learnCard.addView(learnHeader)
-        learnCard.addView(phraseEt)
-        learnCard.addView(actionEt)
-        learnCard.addView(btnTeach)
-        learnCard.addView(memoryTv)
-
-        // 4. Permissions Row
-        val permRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { setMargins(0, 24, 0, 0) }
-        }
-        val btnAcc = Button(this).apply {
-            text = "⚙️ ACCESSIBILITY"
-            setTextColor(Color.WHITE)
-            textSize = 12f
-            background = gradientCard("#1E293B", "#0F172A", 20f, "#334155")
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-            setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
-        }
-        val btnMic = Button(this).apply {
-            text = "🎙 MIC PERMISSION"
-            setTextColor(Color.WHITE)
-            textSize = 12f
-            background = gradientCard("#1E293B", "#0F172A", 20f, "#334155")
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-            setOnClickListener {
-                if (ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-                    ActivityCompat.requestPermissions(this@MainActivity, arrayOf(Manifest.permission.RECORD_AUDIO), 101)
-                } else {
-                    Toast.makeText(this@MainActivity, "Microphone ready!", Toast.LENGTH_SHORT).show()
-                }
-            }
-        }
-        permRow.addView(btnAcc)
-        permRow.addView(btnMic)
-
-        // 5. Discovered Accounts Card
-        val accCard = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            background = gradientCard("#0B1120", "#111827", 30f, "#1E293B")
-            setPadding(36, 30, 36, 30)
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { setMargins(0, 24, 0, 0) }
-        }
-        val accHeader = TextView(this).apply {
-            text = "📂 DISCOVERED MT5 ACCOUNTS"
+        val vaultHint = TextView(this).apply {
+            text = "Format per line: Nickname | Broker | LoginID | Password\nExample: MyXM | XMGlobal | 34200313 | Pass123"
             setTextColor(Color.parseColor("#94A3B8"))
-            typeface = Typeface.DEFAULT_BOLD
-            textSize = 12f
-            setPadding(0, 0, 0, 12)
+            textSize = 11f
+            setPadding(0, 8, 0, 14)
         }
-        accountsTv = TextView(this).apply {
-            setTextColor(Color.parseColor("#E2E8F0"))
+        val credsInput = EditText(this).apply {
+            hint = "MyXM | XMGlobal | 123456 | Password"
+            setHintTextColor(Color.parseColor("#475569"))
+            setTextColor(Color.WHITE)
             textSize = 13f
+            minLines = 3
+            background = bg("#060B19", 18f, "#334155")
+            setPadding(24, 20, 24, 20)
+            setText(prefs.getString("mt5_saved_creds", ""))
         }
-        accCard.addView(accHeader)
-        accCard.addView(accountsTv)
+        val btnSaveVault = makeBtn("💾 SAVE AUTO-LOGIN ACCOUNTS", "#16A34A") {
+            prefs.edit().putString("mt5_saved_creds", credsInput.text.toString().trim()).apply()
+            Toast.makeText(this, "Saved securely on phone!", Toast.LENGTH_SHORT).show()
+        }
 
-        layout.addView(titleTv)
-        layout.addView(subTv)
+        vaultCard.addView(vaultTitle)
+        vaultCard.addView(vaultHint)
+        vaultCard.addView(credsInput)
+        vaultCard.addView(btnSaveVault)
+
+        layout.addView(title)
+        layout.addView(sub)
         layout.addView(statusCard)
+        layout.addView(langLabel)
+        layout.addView(langRow)
         layout.addView(btnLaunch)
-        layout.addView(btnScan)
-        layout.addView(wakeCard)
-        layout.addView(learnCard)
-        layout.addView(permRow)
-        layout.addView(accCard)
+        layout.addView(btnAcc)
+        layout.addView(vaultCard)
 
         scroll.addView(layout)
         setContentView(scroll)
     }
 
-    override fun onResume() {
-        super.onResume()
-        refreshDashboard()
+    private fun refreshLangButtons(prefs: android.content.SharedPreferences) {
+        val isHi = prefs.getString("jarvis_lang", "en") == "hi"
+        btnEn.background = bg(if (!isHi) "#0284C7" else "#1E293B", 20f, if (!isHi) "#38BDF8" else null)
+        btnHi.background = bg(if (isHi) "#0284C7" else "#1E293B", 20f, if (isHi) "#38BDF8" else null)
     }
 
-    private fun refreshDashboard() {
-        val isRunning = MT5AgentService.instance != null
-        statusTv.text = if (isRunning) {
-            "● NEURAL ENGINE ONLINE\n${MT5AgentService.lastBalanceSummary}"
-        } else {
-            "○ ENGINE OFFLINE — Enable Accessibility below"
-        }
-        statusTv.setTextColor(if (isRunning) Color.parseColor("#00E676") else Color.parseColor("#F87171"))
-
-        val rules = LearningMemory.getRules(this)
-        val defLot = LearningMemory.getDefaultLot(this)
-        val rulesText = if (rules.isEmpty()) "None yet (Teach above or say 'Learn x means y')"
-        else rules.entries.joinToString("\n") { "• \"${it.key}\" → ${it.value}" }
-        memoryTv.text = "Learned Default Lot: $defLot\n\nCustom Shortcuts:\n$rulesText"
-
-        val saved = getSharedPreferences("mt5_agent_prefs", Context.MODE_PRIVATE)
-            .getString("mt5_accounts_auto", "") ?: ""
-        accountsTv.text = if (saved.isBlank()) "Tap 'AUTO-SCAN MT5 ACCOUNTS' to detect." else saved
+    override fun onResume() {
+        super.onResume()
+        val running = MT5AgentService.instance != null
+        statusTv.text = if (running) "● JARVIS ENGINE READY\n${MT5AgentService.lastBalanceSummary}" else "○ ENGINE OFFLINE — Enable Accessibility"
+        statusTv.setTextColor(if (running) Color.parseColor("#4ADE80") else Color.parseColor("#F87171"))
     }
 }
