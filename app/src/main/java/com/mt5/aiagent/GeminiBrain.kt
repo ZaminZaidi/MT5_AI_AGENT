@@ -109,15 +109,20 @@ object MT5LocalBrain {
                 setRequestProperty("Content-Type", "application/json")
                 setRequestProperty("X-goog-api-key", apiKey)
                 doOutput = true
-                connectTimeout = 10000
-                readTimeout = 15000
+                connectTimeout = 20000
+                readTimeout = 30000
+            }
+
+            val genConfig = JSONObject().apply {
+                put("responseMimeType", "application/json")
+                put("thinkingConfig", JSONObject().put("thinkingBudget", 0))
             }
 
             val body = JSONObject().apply {
                 put("contents", JSONArray().put(
                     JSONObject().put("parts", JSONArray().put(JSONObject().put("text", prompt)))
                 ))
-                put("generationConfig", JSONObject().put("responseMimeType", "application/json"))
+                put("generationConfig", genConfig)
             }
             OutputStreamWriter(conn.outputStream).use { it.write(body.toString()) }
 
