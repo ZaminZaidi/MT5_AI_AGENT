@@ -64,18 +64,17 @@ object MT5LocalBrain {
         savedAccounts: List<String>,
         credentials: List<SavedCredential>
     ): List<ParsedCommand> {
-        val apiKey = BuildConfig.GEMINI_API_KEY
-        if (apiKey.isNotBlank()) {
-            val cloudResult = askGeminiCloud(apiKey, rawInput, savedAccounts)
-            if (cloudResult.isNotEmpty()) return cloudResult
-        }
-        return listOf(
-            ParsedCommand(
-                TaskType.CHAT_REPLY,
-                replyEn = "Cloud brain offline, boss. Check internet or API secret.",
-                replyHi = "बॉस, क्लाउड एआई ऑफलाइन है। इंटरनेट या एपीआई की चेक करें।"
+        val apiKey = BuildConfig.GEMINI_API_KEY.trim()
+        if (apiKey.isBlank()) {
+            return listOf(
+                ParsedCommand(
+                    TaskType.CHAT_REPLY,
+                    replyEn = "Error: GitHub GEMINI_API_KEY secret is empty.",
+                    replyHi = "एरर: गिटहब सीक्रेट में एपीआई की खाली है।"
+                )
             )
-        )
+        }
+        return askGeminiCloud(apiKey, rawInput, savedAccounts)
     }
 
     private fun askGeminiCloud(apiKey: String, userSpeech: String, savedAccounts: List<String>): List<ParsedCommand> {
@@ -86,7 +85,7 @@ object MT5LocalBrain {
             User said: "$userSpeech"
             Known MT5 accounts: ${savedAccounts.joinToString(", ")}
             
-            Return ONLY a valid JSON array (no markdown, no extra text). Each object:
+            Return ONLY a valid JSON array. Each object:
             {
               "type": "SWITCH_ACCOUNT" | "OPEN_CHART" | "OPEN_TRADE" | "MODIFY_SL_TP" | "CLOSE_TRADE" | "READ_BRIEFING" | "OPEN_WHATSAPP_CHAT" | "SCAN_ACCOUNTS" | "NAVIGATE" | "CHAT_REPLY",
               "accountQuery": "English spelling of account name",
@@ -100,31 +99,39 @@ object MT5LocalBrain {
               "replyEn": "Short Iron-Man JARVIS English reply (max 12 words)",
               "replyHi": "Short natural Hindi reply calling user बॉस (max 12 words)"
             }
-            
-            Example: "Saqib ka account khol ke gold ka chart lagao" ->
-            [{"type":"SWITCH_ACCOUNT","accountQuery":"Sakib","replyEn":"Switching to Sakib and opening Gold chart, boss.","replyHi":"जी बॉस, साकिब अकाउंट खोलकर गोल्ड का चार्ट लगा रहा हूँ।"},{"type":"OPEN_CHART","symbol":"XAUUSD","replyEn":"Opening Gold chart.","replyHi":"गोल्ड चार्ट खोल रहा हूँ।"}]
-            
             For general questions or casual talk, use type "CHAT_REPLY" with a smart answer in replyEn & replyHi.
         """.trimIndent()
 
         return try {
-            val url = URL("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$apiKey")
+            val url = URL("https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent")
             val conn = (url.openConnection() as HttpURLConnection).apply {
                 requestMethod = "POST"
                 setRequestProperty("Content-Type", "application/json")
+                setRequestProperty("X-goog-api-key", apiKey)
                 doOutput = true
                 connectTimeout = 10000
                 readTimeout = 15000
             }
 
-            val body = JSONObject().put(
-                "contents", JSONArray().put(
+            val body = JSONObject().apply {
+                put("contents", JSONArray().put(
                     JSONObject().put("parts", JSONArray().put(JSONObject().put("text", prompt)))
-                )
-            )
+                ))
+                put("generationConfig", JSONObject().put("responseMimeType", "application/json"))
+            }
             OutputStreamWriter(conn.outputStream).use { it.write(body.toString()) }
 
-            if (conn.responseCode !in 200..299) return emptyList()
+            val code = conn.responseCode
+            if (code !in 200..299) {
+                return listOf(
+                    ParsedCommand(
+                        TaskType.CHAT_REPLY,
+                        replyEn = "API Error HTTP $code.",
+                        replyHi = "एपीआई एरर $code आया है बॉस।"
+                    )
+                )
+            }
+
             val responseText = conn.inputStream.bufferedReader().readText()
             var raw = JSONObject(responseText)
                 .getJSONArray("candidates").getJSONObject(0)
@@ -132,7 +139,7 @@ object MT5LocalBrain {
                 .getString("text").trim()
 
             raw = raw.removePrefix("```json").removePrefix("```").removeSuffix("```").trim()
-            val arr = JSONArray(raw)
+            val arr = if (raw.startsWith("[")) JSONArray(raw) else JSONArray().put(JSONObject(raw))
             val list = mutableListOf<ParsedCommand>()
             for (i in 0 until arr.length()) {
                 val o = arr.getJSONObject(i)
@@ -154,8 +161,14 @@ object MT5LocalBrain {
                 )
             }
             list
-        } catch (_: Exception) {
-            emptyList()
+        } catch (e: Exception) {
+            listOf(
+                ParsedCommand(
+                    TaskType.CHAT_REPLY,
+                    replyEn = "Error: ${e.javaClass.simpleName}",
+                    replyHi = "एरर: ${e.javaClass.simpleName}"
+                )
+            )
         }
     }
 }
