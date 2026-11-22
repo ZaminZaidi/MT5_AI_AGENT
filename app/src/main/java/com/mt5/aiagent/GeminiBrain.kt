@@ -45,6 +45,12 @@ data class ParsedCommand(
 
 object MT5LocalBrain {
 
+    private val modelFallbackOrder = listOf(
+        "gemini-2.5-flash-lite",
+        "gemini-2.5-flash",
+        "gemini-flash-latest"
+    )
+
     fun phonetic(s: String): String {
         return s.lowercase()
             .replace("q", "k").replace("z", "j").replace("ph", "f")
@@ -102,78 +108,85 @@ object MT5LocalBrain {
             For general questions or casual talk, use type "CHAT_REPLY" with a smart answer in replyEn & replyHi.
         """.trimIndent()
 
-        return try {
-            val url = URL("https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent")
-            val conn = (url.openConnection() as HttpURLConnection).apply {
-                requestMethod = "POST"
-                setRequestProperty("Content-Type", "application/json")
-                setRequestProperty("X-goog-api-key", apiKey)
-                doOutput = true
-                connectTimeout = 20000
-                readTimeout = 30000
-            }
+        var lastError = "Unknown error"
 
-            val genConfig = JSONObject().apply {
-                put("responseMimeType", "application/json")
-                put("thinkingConfig", JSONObject().put("thinkingBudget", 0))
-            }
+        for (model in modelFallbackOrder) {
+            try {
+                val url = URL("https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent")
+                val conn = (url.openConnection() as HttpURLConnection).apply {
+                    requestMethod = "POST"
+                    setRequestProperty("Content-Type", "application/json")
+                    setRequestProperty("X-goog-api-key", apiKey)
+                    doOutput = true
+                    connectTimeout = 15000
+                    readTimeout = 20000
+                }
 
-            val body = JSONObject().apply {
-                put("contents", JSONArray().put(
-                    JSONObject().put("parts", JSONArray().put(JSONObject().put("text", prompt)))
-                ))
-                put("generationConfig", genConfig)
-            }
-            OutputStreamWriter(conn.outputStream).use { it.write(body.toString()) }
+                val genConfig = JSONObject().apply {
+                    put("responseMimeType", "application/json")
+                    if (!model.contains("lite")) {
+                        put("thinkingConfig", JSONObject().put("thinkingBudget", 0))
+                    }
+                }
 
-            val code = conn.responseCode
-            if (code !in 200..299) {
-                return listOf(
-                    ParsedCommand(
-                        TaskType.CHAT_REPLY,
-                        replyEn = "API Error HTTP $code.",
-                        replyHi = "एपीआई एरर $code आया है बॉस।"
+                val body = JSONObject().apply {
+                    put("contents", JSONArray().put(
+                        JSONObject().put("parts", JSONArray().put(JSONObject().put("text", prompt)))
+                    ))
+                    put("generationConfig", genConfig)
+                }
+                OutputStreamWriter(conn.outputStream).use { it.write(body.toString()) }
+
+                val code = conn.responseCode
+                if (code == 503 || code == 429 || code == 404) {
+                    lastError = "HTTP $code ($model)"
+                    continue // Automatically try the next model
+                }
+                if (code !in 200..299) {
+                    lastError = "HTTP $code"
+                    continue
+                }
+
+                val responseText = conn.inputStream.bufferedReader().readText()
+                var raw = JSONObject(responseText)
+                    .getJSONArray("candidates").getJSONObject(0)
+                    .getJSONObject("content").getJSONArray("parts").getJSONObject(0)
+                    .getString("text").trim()
+
+                raw = raw.removePrefix("```json").removePrefix("```").removeSuffix("```").trim()
+                val arr = if (raw.startsWith("[")) JSONArray(raw) else JSONArray().put(JSONObject(raw))
+                val list = mutableListOf<ParsedCommand>()
+                for (i in 0 until arr.length()) {
+                    val o = arr.getJSONObject(i)
+                    val t = try { TaskType.valueOf(o.optString("type", "CHAT_REPLY")) } catch (_: Exception) { TaskType.CHAT_REPLY }
+                    list.add(
+                        ParsedCommand(
+                            type = t,
+                            symbol = o.optString("symbol", ""),
+                            side = o.optString("side", ""),
+                            lot = o.optString("lot", "0.01"),
+                            sl = o.optString("sl", ""),
+                            tp = o.optString("tp", ""),
+                            accountQuery = o.optString("accountQuery", ""),
+                            chatName = o.optString("chatName", ""),
+                            navTab = o.optString("navTab", ""),
+                            replyEn = o.optString("replyEn", "Right away, boss."),
+                            replyHi = o.optString("replyHi", "जी बॉस।")
+                        )
                     )
-                )
+                }
+                if (list.isNotEmpty()) return list
+            } catch (e: Exception) {
+                lastError = e.javaClass.simpleName
             }
-
-            val responseText = conn.inputStream.bufferedReader().readText()
-            var raw = JSONObject(responseText)
-                .getJSONArray("candidates").getJSONObject(0)
-                .getJSONObject("content").getJSONArray("parts").getJSONObject(0)
-                .getString("text").trim()
-
-            raw = raw.removePrefix("```json").removePrefix("```").removeSuffix("```").trim()
-            val arr = if (raw.startsWith("[")) JSONArray(raw) else JSONArray().put(JSONObject(raw))
-            val list = mutableListOf<ParsedCommand>()
-            for (i in 0 until arr.length()) {
-                val o = arr.getJSONObject(i)
-                val t = try { TaskType.valueOf(o.optString("type", "CHAT_REPLY")) } catch (_: Exception) { TaskType.CHAT_REPLY }
-                list.add(
-                    ParsedCommand(
-                        type = t,
-                        symbol = o.optString("symbol", ""),
-                        side = o.optString("side", ""),
-                        lot = o.optString("lot", "0.01"),
-                        sl = o.optString("sl", ""),
-                        tp = o.optString("tp", ""),
-                        accountQuery = o.optString("accountQuery", ""),
-                        chatName = o.optString("chatName", ""),
-                        navTab = o.optString("navTab", ""),
-                        replyEn = o.optString("replyEn", "Right away, boss."),
-                        replyHi = o.optString("replyHi", "जी बॉस।")
-                    )
-                )
-            }
-            list
-        } catch (e: Exception) {
-            listOf(
-                ParsedCommand(
-                    TaskType.CHAT_REPLY,
-                    replyEn = "Error: ${e.javaClass.simpleName}",
-                    replyHi = "एरर: ${e.javaClass.simpleName}"
-                )
-            )
         }
+
+        return listOf(
+            ParsedCommand(
+                TaskType.CHAT_REPLY,
+                replyEn = "Server busy ($lastError). Try again, boss.",
+                replyHi = "बॉस, सर्वर अभी बिज़ी है ($lastError)। एक सेकंड बाद बोलिए।"
+            )
+        )
     }
 }
